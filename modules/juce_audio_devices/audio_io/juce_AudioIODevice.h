@@ -355,6 +355,10 @@ public:
     */
     virtual int getXRunCount() const noexcept;
 
+    virtual int getAudioInputStreamState() const noexcept;
+
+    virtual int getAudioOutputStreamState() const noexcept;
+
     //==============================================================================
 protected:
     /** Creates a device, setting its name and type member variables. */

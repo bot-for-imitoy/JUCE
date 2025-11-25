@@ -264,6 +264,8 @@ public:
     String getLastError() override                      { return lastError; }
     bool isPlaying() override                           { return callback.get() != nullptr; }
     int getXRunCount() const noexcept override          { return session->getXRunCount(); }
+    int getAudioInputStreamState() const noexcept override    { return session->getInputStreamState(); }
+    int getAudioOutputStreamState() const noexcept override   { return session->getOutputStreamState(); }
 
     int getDefaultBufferSize() override
     {
@@ -533,6 +535,16 @@ private:
             return 0;
         }
 
+        int getState() const
+        {
+            if (stream != nullptr)
+            {
+                return (int)stream->getState();
+            }
+
+            return 0;
+        }
+
     private:
         void open (int deviceId, oboe::Direction direction,
                    oboe::SharingMode sharingMode,
@@ -649,6 +661,26 @@ private:
             int outputXRunCount = jmax (0, outputStream != nullptr ? outputStream->getXRunCount() : 0);
 
             return inputXRunCount + outputXRunCount;
+        }
+
+        int getOutputStreamState() const
+        {
+            if (outputStream)
+            {
+                return outputStream->getState();
+            }
+
+            return 0;
+        }
+
+        int getInputStreamState() const
+        {
+            if (inputStream)
+            {
+                return inputStream->getState();
+            }
+
+            return 0;
         }
 
     protected:
