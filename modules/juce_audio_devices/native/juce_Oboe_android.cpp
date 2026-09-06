@@ -144,16 +144,18 @@ public:
                        int inputDeviceIdToUse,
                        const Array<int>& supportedInputSampleRatesToUse,
                        int maxNumInputChannelsToUse,
-                       int outputDeviceIdToUse,
+                       int requestedOutputDeviceIdToUse,
                        const Array<int>& supportedOutputSampleRatesToUse,
-                       int maxNumOutputChannelsToUse)
+                       int maxNumOutputChannelsToUse,
+                       std::function<void()> routedOutputDeviceChangedCallbackToUse)
         : AudioIODevice (deviceName, oboeTypeName),
           inputDeviceId (inputDeviceIdToUse),
           supportedInputSampleRates (supportedInputSampleRatesToUse),
           maxNumInputChannels (maxNumInputChannelsToUse),
-          outputDeviceId (outputDeviceIdToUse),
+          requestedOutputDeviceId (requestedOutputDeviceIdToUse),
           supportedOutputSampleRates (supportedOutputSampleRatesToUse),
-          maxNumOutputChannels (maxNumOutputChannelsToUse)
+          maxNumOutputChannels (maxNumOutputChannelsToUse),
+          routedOutputDeviceChangedCallback (std::move (routedOutputDeviceChangedCallbackToUse))
     {
     }
 
@@ -177,7 +179,7 @@ public:
             for (auto& sr : outputSampleRates)
                 result.add (sr);
         }
-        else if (outputDeviceId == -1)
+        else if (requestedOutputDeviceId == -1)
         {
             for (auto& sr : inputSampleRates)
                 result.add (sr);
@@ -241,31 +243,48 @@ public:
         jassert (numOutputChans >= 0);
 
         session.reset (OboeSessionBase::create (*this,
-                                                inputDeviceId, outputDeviceId,
+                                                inputDeviceId, requestedOutputDeviceId,
                                                 numInputChans, numOutputChans,
                                                 sampleRate, actualBufferSize));
 
-        deviceOpen = session != nullptr;
+        deviceOpen.store (session != nullptr, std::memory_order_release);
+        replaceRoutedOutputDeviceId (session != nullptr ? session->getRoutedOutputDeviceId()
+                                                        : oboe::kUnspecified);
 
-        if (! deviceOpen)
+        if (session == nullptr)
             lastError = "Failed to create audio session";
+
+        JUCE_OBOE_LOG ("Oboe output route opened: requested=" + String (requestedOutputDeviceId)
+                        + ", routed=" + String (routedOutputDeviceId.load (std::memory_order_acquire)));
 
         return lastError;
     }
 
-    void close() override                               { stop(); }
-    int getOutputLatencyInSamples() override            { return session->getOutputLatencyInSamples(); }
-    int getInputLatencyInSamples() override             { return session->getInputLatencyInSamples(); }
-    bool isOpen() override                              { return deviceOpen; }
+    void close() override
+    {
+        stop();
+        deviceOpen.store (false, std::memory_order_release);
+        replaceRoutedOutputDeviceId (oboe::kUnspecified);
+    }
+
+    int getOutputLatencyInSamples() override            { return session != nullptr ? session->getOutputLatencyInSamples() : 0; }
+    int getInputLatencyInSamples() override             { return session != nullptr ? session->getInputLatencyInSamples() : 0; }
+    bool isOpen() override                              { return deviceOpen.load (std::memory_order_acquire); }
     int getCurrentBufferSizeSamples() override          { return actualBufferSize; }
-    int getCurrentBitDepth() override                   { return session->getCurrentBitDepth(); }
+    int getCurrentBitDepth() override                   { return session != nullptr ? session->getCurrentBitDepth() : 0; }
     BigInteger getActiveOutputChannels() const override { return activeOutputChans; }
     BigInteger getActiveInputChannels() const override  { return activeInputChans; }
     String getLastError() override                      { return lastError; }
     bool isPlaying() override                           { return callback.get() != nullptr; }
-    int getXRunCount() const noexcept override          { return session->getXRunCount(); }
-    int getAudioInputStreamState() const noexcept override    { return session->getInputStreamState(); }
-    int getAudioOutputStreamState() const noexcept override   { return session->getOutputStreamState(); }
+    int getXRunCount() const noexcept override          { return session != nullptr ? session->getXRunCount() : 0; }
+    int getAudioInputStreamState() const noexcept override    { return session != nullptr ? session->getInputStreamState() : 0; }
+    int getAudioOutputStreamState() const noexcept override   { return session != nullptr ? session->getOutputStreamState() : 0; }
+
+    std::optional<int> getRoutedOutputDeviceId() const noexcept override
+    {
+        const auto id = routedOutputDeviceId.load (std::memory_order_acquire);
+        return id == oboe::kUnspecified ? std::optional<int>{} : id;
+    }
 
     int getDefaultBufferSize() override
     {
@@ -279,6 +298,9 @@ public:
 
     void start (AudioIODeviceCallback* newCallback) override
     {
+        if (session == nullptr)
+            return;
+
         if (callback.get() != newCallback)
         {
             if (newCallback != nullptr)
@@ -332,7 +354,7 @@ public:
 private:
     StringArray getChannelNames (bool forInput)
     {
-        auto& deviceId = forInput ? inputDeviceId : outputDeviceId;
+        auto& deviceId = forInput ? inputDeviceId : requestedOutputDeviceId;
         auto& numChannels = forInput ? maxNumInputChannels : maxNumOutputChannels;
 
         // If the device id is unknown (on olders APIs) or if the device claims to
@@ -457,6 +479,18 @@ private:
         }
     }
 
+    int replaceRoutedOutputDeviceId (int id) noexcept
+    {
+        const auto routedId = id > oboe::kUnspecified ? id : oboe::kUnspecified;
+        return routedOutputDeviceId.exchange (routedId, std::memory_order_acq_rel);
+    }
+
+    void notifyRoutedOutputDeviceChanged()
+    {
+        if (routedOutputDeviceChangedCallback != nullptr)
+            routedOutputDeviceChangedCallback();
+    }
+
     //==============================================================================
     class OboeStream
     {
@@ -518,6 +552,12 @@ private:
         {
             jassert (openedOk());
             return stream;
+        }
+
+        int getDeviceId() const noexcept
+        {
+            return openedOk() && stream != nullptr ? stream->getDeviceId()
+                                                   : oboe::kUnspecified;
         }
 
         int getXRunCount() const
@@ -636,7 +676,7 @@ private:
     {
     public:
         static OboeSessionBase* create (OboeAudioIODevice& owner,
-                                        int inputDeviceId, int outputDeviceId,
+                                        int inputDeviceId, int requestedOutputDeviceId,
                                         int numInputChannels, int numOutputChannels,
                                         int sampleRate, int bufferSize);
 
@@ -654,6 +694,11 @@ private:
         }
 
         int getCurrentBitDepth() const noexcept { return bitDepth; }
+
+        int getRoutedOutputDeviceId() const noexcept
+        {
+            return outputStream != nullptr ? outputStream->getDeviceId() : oboe::kUnspecified;
+        }
 
         int getXRunCount() const
         {
@@ -685,14 +730,14 @@ private:
 
     protected:
         OboeSessionBase (OboeAudioIODevice& ownerToUse,
-                         int inputDeviceIdToUse, int outputDeviceIdToUse,
+                         int inputDeviceIdToUse, int requestedOutputDeviceIdToUse,
                          int numInputChannelsToUse, int numOutputChannelsToUse,
                          int sampleRateToUse, int bufferSizeToUse,
                          oboe::AudioFormat streamFormatToUse,
                          int bitDepthToUse)
             : owner (ownerToUse),
               inputDeviceId (inputDeviceIdToUse),
-              outputDeviceId (outputDeviceIdToUse),
+              requestedOutputDeviceId (requestedOutputDeviceIdToUse),
               numInputChannels (numInputChannelsToUse),
               numOutputChannels (numOutputChannelsToUse),
               sampleRate (sampleRateToUse),
@@ -711,7 +756,9 @@ private:
                                [[maybe_unused]] int expectedBufferSize,
                                oboe::AudioFormat format)
         {
-            if ([[maybe_unused]] auto nativeStream = stream != nullptr ? stream->getNativeStream() : nullptr)
+            if ([[maybe_unused]] auto nativeStream = stream != nullptr && stream->openedOk()
+                                                       ? stream->getNativeStream()
+                                                       : nullptr)
             {
                 jassert (numChannels == 0 || numChannels == nativeStream->getChannelCount());
                 jassert (expectedSampleRate == 0 || expectedSampleRate == nativeStream->getSampleRate());
@@ -734,7 +781,7 @@ private:
 
         void openStreams()
         {
-            outputStream = std::make_unique<OboeStream> (outputDeviceId,
+            outputStream = std::make_unique<OboeStream> (requestedOutputDeviceId,
                                                          oboe::Direction::Output,
                                                          oboe::SharingMode::Exclusive,
                                                          numOutputChannels,
@@ -743,7 +790,7 @@ private:
                                                          bufferSize,
                                                          static_cast<AudioStreamCallback*> (this));
 
-            checkStreamSetup (outputStream.get(), outputDeviceId, numOutputChannels,
+            checkStreamSetup (outputStream.get(), requestedOutputDeviceId, numOutputChannels,
                               sampleRate, bufferSize, streamFormat);
 
             if (numInputChannels <= 0)
@@ -774,7 +821,7 @@ private:
         }
 
         OboeAudioIODevice& owner;
-        int inputDeviceId, outputDeviceId;
+        const int inputDeviceId, requestedOutputDeviceId;
         int numInputChannels, numOutputChannels;
         int sampleRate;
         int bufferSize;
@@ -807,6 +854,9 @@ private:
 
         void start() override
         {
+            if (! openedOk())
+                return;
+
             if (inputStream != nullptr)
                 inputStream->start();
 
@@ -995,20 +1045,53 @@ private:
 
             JUCE_OBOE_LOG ("Oboe stream onErrorAfterClose(): " + getOboeString (error));
 
-            const SpinLock::ScopedTryLockType streamRestartLock { streamRestartMutex };
+            bool routedOutputChanged = false;
+            int previousRoutedOutputDeviceId = oboe::kUnspecified;
+            int currentRoutedOutputDeviceId = oboe::kUnspecified;
 
-            if (! streamRestartLock.isLocked())
-                return;
+            {
+                const SpinLock::ScopedTryLockType streamRestartLock { streamRestartMutex };
 
-            const SpinLock::ScopedLockType audioCallbackLock { audioCallbackMutex };
+                if (! streamRestartLock.isLocked())
+                    return;
 
-            destroyStreams();
+                const SpinLock::ScopedLockType audioCallbackLock { audioCallbackMutex };
 
-            if (error != oboe::Result::ErrorDisconnected)
-                return;
+                previousRoutedOutputDeviceId = owner.replaceRoutedOutputDeviceId (oboe::kUnspecified);
+                destroyStreams();
 
-            openStreams();
-            start();
+                if (error == oboe::Result::ErrorDisconnected)
+                {
+                    openStreams();
+
+                    if (openedOk())
+                    {
+                        currentRoutedOutputDeviceId = getRoutedOutputDeviceId();
+                        owner.replaceRoutedOutputDeviceId (currentRoutedOutputDeviceId);
+                        owner.deviceOpen.store (true, std::memory_order_release);
+                        start();
+                    }
+                    else
+                    {
+                        owner.deviceOpen.store (false, std::memory_order_release);
+                        JUCE_OBOE_LOG ("Failed to reopen Oboe streams after disconnection");
+                    }
+                }
+                else
+                {
+                    owner.deviceOpen.store (false, std::memory_order_release);
+                }
+
+                routedOutputChanged = previousRoutedOutputDeviceId != currentRoutedOutputDeviceId;
+            }
+
+            JUCE_OBOE_LOG ("Oboe output route changed: requested=" + String (requestedOutputDeviceId)
+                            + ", previous=" + String (previousRoutedOutputDeviceId)
+                            + ", current=" + String (currentRoutedOutputDeviceId)
+                            + ", reason=" + getOboeString (error));
+
+            if (routedOutputChanged)
+                owner.notifyRoutedOutputDeviceChanged();
         }
 
         void destroyStreams()
@@ -1035,7 +1118,7 @@ private:
 
     //==============================================================================
     int actualBufferSize = 0, sampleRate = 0;
-    bool deviceOpen = false;
+    std::atomic<bool> deviceOpen { false };
     String lastError;
     BigInteger activeOutputChans, activeInputChans;
     Atomic<AudioIODeviceCallback*> callback { nullptr };
@@ -1043,9 +1126,12 @@ private:
     int inputDeviceId;
     Array<int> supportedInputSampleRates;
     int maxNumInputChannels;
-    int outputDeviceId;
+    const int requestedOutputDeviceId;
     Array<int> supportedOutputSampleRates;
     int maxNumOutputChannels;
+
+    std::atomic<int> routedOutputDeviceId { oboe::kUnspecified };
+    std::function<void()> routedOutputDeviceChangedCallback;
 
     std::unique_ptr<OboeSessionBase> session;
 
@@ -1057,7 +1143,7 @@ private:
 //==============================================================================
 OboeAudioIODevice::OboeSessionBase* OboeAudioIODevice::OboeSessionBase::create (OboeAudioIODevice& owner,
                                                                                 int inputDeviceId,
-                                                                                int outputDeviceId,
+                                                                                int requestedOutputDeviceId,
                                                                                 int numInputChannels,
                                                                                 int numOutputChannels,
                                                                                 int sampleRate,
@@ -1067,7 +1153,7 @@ OboeAudioIODevice::OboeSessionBase* OboeAudioIODevice::OboeSessionBase::create (
     // SDK versions 21 and higher should natively support floating point...
     std::unique_ptr<OboeSessionBase> session = std::make_unique<OboeSessionImpl<float>> (owner,
                                                                                          inputDeviceId,
-                                                                                         outputDeviceId,
+                                                                                         requestedOutputDeviceId,
                                                                                          numInputChannels,
                                                                                          numOutputChannels,
                                                                                          sampleRate,
@@ -1079,7 +1165,7 @@ OboeAudioIODevice::OboeSessionBase* OboeAudioIODevice::OboeSessionBase::create (
 
     if (session == nullptr)
     {
-        session.reset (new OboeSessionImpl<int16> (owner, inputDeviceId, outputDeviceId,
+        session.reset (new OboeSessionImpl<int16> (owner, inputDeviceId, requestedOutputDeviceId,
                                                    numInputChannels, numOutputChannels, sampleRate, bufferSize));
 
         if (session != nullptr && (! session->openedOk()))
@@ -1090,14 +1176,49 @@ OboeAudioIODevice::OboeSessionBase* OboeAudioIODevice::OboeSessionBase::create (
 }
 
 //==============================================================================
+class OboeAudioIODeviceType;
+
+class OboeAudioIODeviceTypeRouteChangeSignal final
+{
+public:
+    explicit OboeAudioIODeviceTypeRouteChangeSignal (OboeAudioIODeviceType* ownerToUse)
+        : owner (ownerToUse),
+          updater ([this] { notifyOwner(); })
+    {
+    }
+
+    void triggerAsyncUpdate()
+    {
+        updater.triggerAsyncUpdate();
+    }
+
+    void invalidate()
+    {
+        owner.store (nullptr, std::memory_order_release);
+        updater.cancelPendingUpdate();
+    }
+
+private:
+    void notifyOwner();
+
+    std::atomic<OboeAudioIODeviceType*> owner;
+    LockingAsyncUpdater updater;
+};
+
 class OboeAudioIODeviceType final : public AudioIODeviceType
 {
 public:
     OboeAudioIODeviceType()
-        : AudioIODeviceType (OboeAudioIODevice::oboeTypeName)
+        : AudioIODeviceType (OboeAudioIODevice::oboeTypeName),
+          routeChangeSignal (std::make_shared<OboeAudioIODeviceTypeRouteChangeSignal> (this))
     {
         // Not using scanForDevices() to maintain behaviour backwards compatible with older APIs
         checkAvailableDevices();
+    }
+
+    ~OboeAudioIODeviceType() override
+    {
+        routeChangeSignal->invalidate();
     }
 
     //==============================================================================
@@ -1123,7 +1244,7 @@ public:
         if (auto oboeDevice = static_cast<OboeAudioIODevice*> (device))
         {
             auto oboeDeviceId = asInput ? oboeDevice->inputDeviceId
-                                        : oboeDevice->outputDeviceId;
+                                        : oboeDevice->requestedOutputDeviceId;
 
             auto& devices = asInput ? inputDevices : outputDevices;
 
@@ -1153,7 +1274,8 @@ public:
                                       inputDeviceInfo.id, inputDeviceInfo.sampleRates,
                                       inputDeviceInfo.numChannels,
                                       outputDeviceInfo.id, outputDeviceInfo.sampleRates,
-                                      outputDeviceInfo.numChannels);
+                                      outputDeviceInfo.numChannels,
+                                      [signal = routeChangeSignal] { signal->triggerAsyncUpdate(); });
     }
 
     static bool isOboeAvailable()
@@ -1166,6 +1288,11 @@ public:
     }
 
  private:
+    void notifyRoutedOutputDeviceChanged()
+    {
+        callDeviceChangeListeners();
+    }
+
     void checkAvailableDevices()
     {
         auto sampleRates = OboeAudioIODevice::getDefaultSampleRates();
@@ -1343,10 +1470,19 @@ public:
         return {};
     }
 
+    friend class OboeAudioIODeviceTypeRouteChangeSignal;
+
+    std::shared_ptr<OboeAudioIODeviceTypeRouteChangeSignal> routeChangeSignal;
     Array<DeviceInfo> inputDevices, outputDevices;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OboeAudioIODeviceType)
 };
+
+void OboeAudioIODeviceTypeRouteChangeSignal::notifyOwner()
+{
+    if (auto* currentOwner = owner.load (std::memory_order_acquire))
+        currentOwner->notifyRoutedOutputDeviceChanged();
+}
 
 const char* const OboeAudioIODevice::oboeTypeName = "Android Oboe";
 

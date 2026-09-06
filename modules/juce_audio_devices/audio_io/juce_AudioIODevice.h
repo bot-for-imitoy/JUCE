@@ -359,6 +359,13 @@ public:
 
     virtual int getAudioOutputStreamState() const noexcept;
 
+    /** Returns the physical output device ID used by the current stream, when available.
+
+        The returned ID is a runtime routing key and must not be persisted. Backends that
+        cannot report an actual routed output device return nullopt.
+    */
+    virtual std::optional<int> getRoutedOutputDeviceId() const noexcept { return {}; }
+
     //==============================================================================
 protected:
     /** Creates a device, setting its name and type member variables. */
