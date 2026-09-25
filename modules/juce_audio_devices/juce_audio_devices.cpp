@@ -188,6 +188,7 @@
   #include <pipewire/extensions/metadata.h>
   #include <spa/param/audio/format-utils.h>
   #include <spa/param/audio/raw.h>
+  #include <spa/param/audio/raw-types.h>
   JUCE_END_IGNORE_WARNINGS_GCC_LIKE
   #include "native/juce_PipeWire_linux.cpp"
  #endif

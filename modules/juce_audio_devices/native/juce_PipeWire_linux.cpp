@@ -125,6 +125,7 @@ JUCE_DECL_VOID_PIPEWIRE_FUNCTION (pw_stream_add_listener, (struct pw_stream* str
 JUCE_DECL_PIPEWIRE_FUNCTION (int, pw_stream_connect, (struct pw_stream* stream, enum pw_direction direction, uint32_t target_id, enum pw_stream_flags flags, const struct spa_pod** params, uint32_t n_params), (stream, direction, target_id, flags, params, n_params))
 JUCE_DECL_PIPEWIRE_FUNCTION (uint32_t, pw_stream_get_node_id, (struct pw_stream* stream), (stream))
 JUCE_DECL_VOID_PIPEWIRE_FUNCTION (pw_stream_disconnect, (struct pw_stream* stream), (stream))
+JUCE_DECL_PIPEWIRE_FUNCTION (const char*, pw_stream_state_as_string, (enum pw_stream_state state), (state))
 JUCE_DECL_PIPEWIRE_FUNCTION (struct pw_buffer*, pw_stream_dequeue_buffer, (struct pw_stream* stream), (stream))
 JUCE_DECL_VOID_PIPEWIRE_FUNCTION (pw_stream_queue_buffer, (struct pw_stream* stream, struct pw_buffer* buffer), (stream, buffer))
 JUCE_DECL_PIPEWIRE_FUNCTION (int, pw_stream_set_active, (struct pw_stream* stream, bool active), (stream, active))
@@ -1258,6 +1259,15 @@ private:
         info.channels = (uint32_t) data.numChannels;
         info.rate = (uint32_t) requestedSampleRate;
 
+        // Preserve the channel positions selected by the caller.
+        const auto& channelNames = data.isCapture ? inputChannelNames : outputChannelNames;
+        const auto& enabledChannels = data.isCapture ? enabledInputChannels : enabledOutputChannels;
+        int position = 0;
+
+        for (int channel = 0; channel < channelNames.size() && position < SPA_AUDIO_MAX_CHANNELS; ++channel)
+            if (enabledChannels[channel])
+                info.position[position++] = spa_type_audio_channel_from_short_name (channelNames[channel].toRawUTF8());
+
         const struct spa_pod* params[1];
         params[0] = spa_format_audio_raw_build (&builder, SPA_PARAM_EnumFormat, &info);
 
@@ -1399,7 +1409,7 @@ private:
         if (shuttingDown.load())
             return;
 
-        JUCE_PIPEWIRE_LOG ("PipeWire stream changed state to " << pw_stream_state_as_string (state)
+        JUCE_PIPEWIRE_LOG ("PipeWire stream changed state to " << juce::pw_stream_state_as_string (state)
                              << (error != nullptr ? (String (": ") + String (error)) : String()));
 
         if (state == PW_STREAM_STATE_ERROR)
