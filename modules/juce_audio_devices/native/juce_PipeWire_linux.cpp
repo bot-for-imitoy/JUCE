@@ -799,6 +799,15 @@ public:
         // against us, so this happens without the lifecycle lock held.
         setCallback (nullptr);
 
+        // The monitor thread may be waiting for the lifecycle lock inside
+        // checkGraph(), so it has to be stopped before that lock is taken:
+        // waiting for a thread that is itself waiting for the lock we hold would
+        // stall this call for the whole timeout (and leave the device half shut
+        // down when the wait fails). shuttingDown makes an in-flight scan
+        // abandon its work instead of touching the server objects.
+        shuttingDown = true;
+        stopMonitorThread();
+
         {
             const ScopedLock sl (lifecycleLock);
 
@@ -824,6 +833,13 @@ public:
     void close() override
     {
         setCallback (nullptr);
+
+        // See open(): the monitor thread is stopped before the lifecycle lock is
+        // taken, because it may be blocked waiting for that same lock inside
+        // checkGraph(). Waiting for it while holding the lock would stall
+        // close() for the whole timeout.
+        shuttingDown = true;
+        stopMonitorThread();
 
         const ScopedLock sl (lifecycleLock);
         closeInternal();
@@ -1970,7 +1986,13 @@ private:
 
         // If we're only recording, drive the callback directly from here,
         // otherwise store the data for the next playback block.
-        if (playbackStream == nullptr)
+        //
+        // This runs on the loop thread, while the playback stream is created and
+        // destroyed by the control thread, so the atomic flag is used as the
+        // criterion rather than the pointer itself: it is set before either
+        // stream is connected (which is the earliest a capture callback can
+        // arrive) and cleared only once the loop thread has stopped.
+        if (! wantPlaybackStream.load())
         {
             currentBufferSize = numSamples;
 
@@ -2347,11 +2369,20 @@ private:
             return false;
         }
 
+        // Resume only when there is still a host callback to resume: a rebuild
+        // that follows a stream error or a lost server detaches the callback
+        // (notifyHostStopped()) and tells the host that the device has stopped,
+        // so claiming to be playing would report a running device that silently
+        // delivers nothing - and the host would miss the
+        // audioDeviceAboutToStart() that publishes the new sample rate and
+        // block size.
+        const bool haveCallback = callback.load (std::memory_order_acquire) != nullptr;
+
         // The sample rate or block size may have changed since the host was last
         // told about this device, so notify it before the streams are activated.
         // This happens outside of the lifecycle lock, like in start(), because
         // the host is allowed to call back into the device from here.
-        if (shouldResume && resumeAfterwards)
+        if (shouldResume && haveCallback && resumeAfterwards)
             if (auto* cb = callback.load (std::memory_order_acquire))
                 cb->audioDeviceAboutToStart (this);
 
@@ -2366,10 +2397,19 @@ private:
 
             resumeAfterRecovery = false;
 
-            if (shouldResume)
+            // The callback is re-checked under the lock because the host may
+            // have started us again while the streams were being rebuilt.
+            if (shouldResume && callback.load (std::memory_order_acquire) != nullptr)
             {
                 setActive (true);
                 isPlaying_ = true;
+            }
+            else if (shouldResume)
+            {
+                // There is nothing to deliver audio to - the host has already
+                // been told that the device stopped - so don't report ourselves
+                // as playing.
+                isPlaying_ = false;
             }
         }
 
