@@ -1340,17 +1340,24 @@ private:
     }
 
     // Returns false if the loop thread is still running, in which case nothing
-    // may be destroyed and the caller has to try again later.
+    // that depends on the loop may be destroyed and the caller has to try again
+    // later.
     bool teardownServerObjects()
     {
+        // Stream destruction is synchronous: pw_stream_destroy() queues a
+        // round-trip on the loop and blocks until the loop has processed it.
+        // The loop thread therefore has to stay alive while the streams are
+        // torn down, otherwise the call blocks forever waiting for a loop that
+        // is no longer being pumped.
+        destroyStreamObjects();
+
         if (audioThread != nullptr)
         {
-            // Every PipeWire object below may still be dispatching callbacks on
-            // the loop thread, so the thread has to be gone before anything is
-            // freed. waitForThreadToExit() is used rather than stopThread():
-            // the latter force-kills the thread (with pthread_cancel) once the
-            // timeout expires, which can leave PipeWire's internal locks in an
-            // inconsistent state.
+            // The streams are gone, so no PipeWire callback can be dispatched
+            // any more and the loop thread can be stopped. waitForThreadToExit()
+            // is used rather than stopThread(): the latter force-kills the
+            // thread (with pthread_cancel) once the timeout expires, which can
+            // leave PipeWire's internal locks in an inconsistent state.
             audioThread->signalThreadShouldExit();
 
             if (! audioThread->waitForThreadToExit (loopThreadStopTimeoutMs))
@@ -1358,10 +1365,6 @@ private:
 
             audioThread.reset();
         }
-
-        // No callback can be running now, so the streams and the loop can be
-        // destroyed from this thread.
-        destroyStreamObjects();
 
         if (pwCore != nullptr)
         {
@@ -1742,8 +1745,11 @@ private:
 
             if (! streamErrorNotified.exchange (true))
             {
+                // Resume after recovery only if the host still had us playing,
+                // mirroring notifyServerLost(): a stream that fails while the
+                // device is idle must not make it start playing on its own.
+                resumeAfterRecovery = isPlaying_.load();
                 isPlaying_ = false;
-                resumeAfterRecovery = true;
 
                 // The monitor thread notifies the host and rebuilds the
                 // streams; user callbacks are never invoked from here.
