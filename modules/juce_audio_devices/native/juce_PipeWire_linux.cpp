@@ -812,13 +812,14 @@ private:
       so they are safe to call from a realtime thread.
 
     - start(), stop(), getOutputLatencyInSamples() and getInputLatencyInSamples()
-      take the lifecycle lock, and getRoutedOutputDeviceName() adds a registry
-      round-trip on top, so none of them may be called from a realtime thread.
-      start() and stop() no longer wait for an in-flight callback of their own
-      (see waitForInFlightCallbacks()), but the lock they take is reason enough
-      by itself. The remaining getters aren't realtime fodder either - several
-      hand back a container by value - so the five above are the whole of the
-      audio-thread interface.
+      take the lifecycle lock. getRoutedOutputDeviceName() doesn't take that
+      lock - it only guards its own short-lived cache - but it opens a connection
+      of its own and walks the whole graph. None of them may be called from a
+      realtime thread. start() and stop() no longer wait for an in-flight
+      callback of their own (see waitForInFlightCallbacks()), but the lock they
+      take is reason enough by itself. The remaining getters aren't realtime
+      fodder either - several hand back a container by value - so the five above
+      are the whole of the audio-thread interface.
 
     - The lock can be held for seconds, because the monitor thread keeps it
       across a rebuild - and a rebuild is what makes an audio-thread caller
