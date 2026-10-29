@@ -185,6 +185,10 @@
     have the PipeWire development headers installed in order to compile with
     this flag enabled. The package you need to install is "libpipewire-0.3-dev".
 
+    The headers are installed outside of the default include path (usually in
+    /usr/include/pipewire-0.3 and /usr/include/spa-0.2), so these directories
+    have to be added to the include path of your build as well.
+
     If you have PipeWire installed and want to use it, set the JUCE_PIPEWIRE
     flag to 1.
 */

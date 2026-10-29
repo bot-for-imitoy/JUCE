@@ -332,9 +332,15 @@ void AudioDeviceManager::createAudioDeviceTypes (OwnedArray<AudioIODeviceType>& 
     addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_ASIO());
     addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_CoreAudio());
     addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_iOSAudio());
+
+    // PipeWire is added before the ALSA and JACK types so that enabling
+    // JUCE_PIPEWIRE also gives it priority: AudioDeviceManager falls back to the
+    // first type that reports any devices. The factory returns nullptr when the
+    // flag is off, or when libpipewire isn't installed, so the order is unchanged
+    // for everyone else.
+    addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_PipeWire());
     addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_ALSA());
     addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_JACK());
-    addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_PipeWire());
     addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_Oboe());
     addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_OpenSLES());
     addIfNotNull (list, AudioIODeviceType::createAudioIODeviceType_Android());

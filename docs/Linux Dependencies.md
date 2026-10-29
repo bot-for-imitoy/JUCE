@@ -24,7 +24,7 @@ or
 #### juce_audio_devices
 - libasound2-dev
 - libjack-jackd2-dev (unless `JUCE_JACK=0`)
-- libpipewire-0.3-dev (only needed when `JUCE_PIPEWIRE=1`)
+- libpipewire-0.3-dev (only needed when `JUCE_PIPEWIRE=1`, which is off by default)
 
 #### juce_audio_processors
 - ladspa-sdk (unless `JUCE_PLUGINHOST_LADSPA=0`)
@@ -67,10 +67,26 @@ available during runtime.
 The full command is as follows:
 
     sudo apt update
-    sudo apt install libasound2-dev libjack-jackd2-dev libpipewire-0.3-dev \
+    sudo apt install libasound2-dev libjack-jackd2-dev \
         ladspa-sdk \
         libcurl4-openssl-dev  \
         libfreetype-dev libfontconfig1-dev \
         libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libxi-dev \
         libwebkit2gtk-4.1-dev \
         libglu1-mesa-dev mesa-common-dev libegl-dev
+
+## Optional: PipeWire
+
+The PipeWire backend is disabled by default. To build with it, set
+`JUCE_PIPEWIRE=1` and install the development headers:
+
+    sudo apt install libpipewire-0.3-dev
+
+libpipewire is loaded at run time, so nothing has to be linked, but the compiler
+has to be able to find the headers. The package installs them into
+`/usr/include/pipewire-0.3` and `/usr/include/spa-0.2`, which are not in the
+default include path. With CMake, the pkg-config module adds both:
+
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
+    target_include_directories(<target> PRIVATE ${PIPEWIRE_INCLUDE_DIRS})

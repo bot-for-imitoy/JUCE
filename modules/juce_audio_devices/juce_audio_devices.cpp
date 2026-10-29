@@ -183,7 +183,10 @@
                                        "-Wsign-conversion",
                                        "-Wcast-align",
                                        "-Wshadow",
-                                       "-Wshadow-field")
+                                       "-Wshadow-field",
+                                       "-Wvariadic-macros",
+                                       "-Wc++20-extensions",
+                                       "-Wpedantic")
   #include <pipewire/pipewire.h>
   #include <pipewire/extensions/metadata.h>
   #include <spa/param/audio/format-utils.h>
