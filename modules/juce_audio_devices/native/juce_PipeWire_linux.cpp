@@ -835,15 +835,16 @@ private:
     - open() and close() must never be called from an audio thread at all.
       Tearing the streams down blocks until PipeWire's data loop has finished the
       process callback it is running (pw_stream_destroy() takes that loop's mutex
-      through spa_loop_locked()), so calling them from inside the callback asks
-      the data loop to wait for itself. AudioIODevice's own contract already
+      through pw_loop_locked() or a blocking pw_loop_invoke(), depending on the
+      PipeWire version), so calling them from inside the callback asks the data
+      loop to wait for itself. AudioIODevice's own contract already
       requires stop() to flush pending callbacks before returning, which no
       implementation can do from within one of them, so this is not a
       restriction that is specific to this backend.
 
     The host is never notified from the PipeWire data loop either, and never with
     the lifecycle lock held: audioDeviceError() is sent from the monitor thread,
-    audioDeviceAboutToStart() from the monitor thread after a rebuild and from
+    audioDeviceAboutToStart() from the monitor thread during a rebuild and from
     whoever called start(), and audioDeviceStopped() from whoever detaches the
     callback - start(), stop(), open() or close().
 */
