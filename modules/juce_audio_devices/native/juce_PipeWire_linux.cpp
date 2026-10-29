@@ -807,7 +807,28 @@ private:
 
     Threading contract:
 
-    - open() and close() must not be called from this device's audio callback.
+    - isOpen(), isPlaying(), getCurrentSampleRate(),
+      getCurrentBufferSizeSamples() and getXRunCount() read nothing but atomics,
+      so they are safe to call from a realtime thread.
+
+    - start(), stop(), getOutputLatencyInSamples() and getInputLatencyInSamples()
+      take the lifecycle lock, and getRoutedOutputDeviceName() adds a registry
+      round-trip on top, so none of them may be called from a realtime thread.
+      start() and stop() no longer wait for an in-flight callback of their own
+      (see waitForInFlightCallbacks()), but the lock they take is reason enough
+      by itself. The remaining getters aren't realtime fodder either - several
+      hand back a container by value - so the five above are the whole of the
+      audio-thread interface.
+
+    - The lock can be held for seconds, because the monitor thread keeps it
+      across a rebuild - and a rebuild is what makes an audio-thread caller
+      circular:
+
+          data loop   : process callback -> host asks for the latency -> lock
+          monitor     : holds the lock -> teardown -> loop thread
+          loop thread : pw_stream_destroy() -> data loop leaves the callback
+
+    - open() and close() must never be called from an audio thread at all.
       Tearing the streams down blocks until PipeWire's data loop has finished the
       process callback it is running (pw_stream_destroy() takes that loop's mutex
       through spa_loop_locked()), so calling them from inside the callback asks
@@ -815,12 +836,12 @@ private:
       requires stop() to flush pending callbacks before returning, which no
       implementation can do from within one of them, so this is not a
       restriction that is specific to this backend.
-    - start(), stop() and the queries may be called from the audio callback.
-      They never wait for a callback that belongs to the calling thread.
-    - The host is never called back from the PipeWire data loop, and never with
-      the lifecycle lock held: audioDeviceError() and the audioDeviceAboutToStart()
-      that follows a rebuild are sent from the monitor thread, and the one in
-      start() from whoever called start().
+
+    The host is never notified from the PipeWire data loop either, and never with
+    the lifecycle lock held: audioDeviceError() is sent from the monitor thread,
+    audioDeviceAboutToStart() from the monitor thread after a rebuild and from
+    whoever called start(), and audioDeviceStopped() from whoever detaches the
+    callback - start(), stop(), open() or close().
 */
 class PipeWireAudioIODevice final : public AudioIODevice
 {
@@ -885,9 +906,9 @@ public:
                  int bufferSizeSamples) override
     {
         // Taking the host callback out of the picture waits for any IO callback
-        // that is already running, and the host is allowed to query the device
-        // (latency, routing) from inside its IO callback, so this happens
-        // without the lifecycle lock held.
+        // that is already running, and that callback may well be sitting in one
+        // of the latency queries waiting for the lifecycle lock, so this has to
+        // happen before the lock is taken rather than under it.
         setCallback (nullptr);
 
         // The monitor thread may be waiting for the lifecycle lock inside
@@ -1083,8 +1104,8 @@ public:
     }
 
     //==============================================================================
-    String getSinkKey() const     { return sinkKey; }
-    String getSourceKey() const   { return sourceKey; }
+    const String& getSinkKey() const     { return sinkKey; }
+    const String& getSourceKey() const   { return sourceKey; }
 
 private:
     //==============================================================================
@@ -1157,10 +1178,11 @@ private:
         // return until the call that got us here returns. Waiting for it would
         // deadlock, so the wait is skipped for that one case.
         //
-        // Skipping it is all that start() and stop() need. close() and open()
-        // still have to tear the streams down, which blocks on PipeWire's data
-        // loop - the loop the calling callback is running on - so they must not
-        // be called from there at all. See the threading contract above the
+        // Skipping it only stops the wait from blocking on the calling thread.
+        // It does not make the call safe: start() and stop() take the lifecycle
+        // lock right after this, and close()/open() block on PipeWire's data
+        // loop - the loop the calling callback is running on. None of them may
+        // be called from the audio thread; see the threading contract above the
         // class.
         if (callbackOnCurrentThread == this)
             return;
@@ -2650,15 +2672,20 @@ private:
     String lastError;
     mutable CriticalSection errorLock;
 
-    // Serialises open/close and the monitor thread's restarts.
+    // Serialises open/close and the monitor thread's restarts. start() and
+    // stop() take it too (for setActive(), which round-trips through the loop),
+    // as do the two latency queries.
     //
-    // The wait for the server at the end of open() deliberately happens without
-    // it, but the teardown and the stream creation do not: destroying the
-    // streams waits for the PipeWire loop thread (up to loopThreadStopTimeoutMs
-    // per attempt) and pw_stream_connect() blocks until that loop has marshalled
-    // it. A caller that needs the lock in that window - the latency and the
-    // routing queries - is expected to block for up to a few seconds in the
-    // worst case, which is why none of them may be called from the audio thread.
+    // The waits for the server at the end of open() and in restartServerSide()
+    // deliberately happen without it, but the teardown and the stream creation
+    // do not: destroying the streams waits for the PipeWire loop thread (up to
+    // loopThreadStopTimeoutMs per attempt) and pw_stream_connect() blocks until
+    // that loop has marshalled it. A rebuild therefore holds this for seconds,
+    // and every caller has to be able to afford that - the queries that only
+    // want to know which sink is being followed included.
+    //
+    // That is why nothing reachable from a realtime thread may take it, and why
+    // the class comment lists the handful of queries that are allowed there.
     CriticalSection lifecycleLock;
 
     // Serialises callback swaps. Never taken while lifecycleLock is held.

@@ -174,6 +174,11 @@
 
      If you don't have PipeWire installed and don't want to build JUCE with
      PipeWire support, just set the JUCE_PIPEWIRE flag to 0.
+
+     The last three flags are the pedantic family: with -Wpedantic turned on,
+     these headers produce braced-group, compound-literal and empty variadic
+     macro diagnostics. Recent GCC reports the last group as -Wc++20-extensions,
+     older releases use -Wvariadic-macros, so both are listed here.
   */
   JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wzero-length-array",
                                        "-Wold-style-cast",

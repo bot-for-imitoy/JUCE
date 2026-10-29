@@ -85,7 +85,9 @@ The PipeWire backend is disabled by default. To build with it, set
 libpipewire is loaded at run time, so nothing has to be linked, but the compiler
 has to be able to find the headers. The package installs them into
 `/usr/include/pipewire-0.3` and `/usr/include/spa-0.2`, which are not in the
-default include path. With CMake, the pkg-config module adds both:
+default include path. `libpipewire-0.3.pc` lists `libspa-0.2` in its `Requires:`,
+so asking pkg-config for the former prints both `-I` flags - with CMake this is
+enough:
 
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
