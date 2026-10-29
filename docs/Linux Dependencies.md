@@ -90,5 +90,10 @@ so asking pkg-config for the former prints both `-I` flags - with CMake this is
 enough:
 
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
-    target_include_directories(<target> PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
+    pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+    target_link_libraries(<target> PRIVATE PkgConfig::PIPEWIRE)
+
+Using the imported target keeps the include directories and any compile flags
+attached to the right scope, and CMake adds an imported target's include
+directories as system includes (`-isystem`) rather than plain `-I`. That also
+avoids a number of pedantic warnings from these third-party headers.

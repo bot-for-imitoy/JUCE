@@ -808,22 +808,25 @@ private:
     Threading contract:
 
     - isOpen(), isPlaying(), getCurrentSampleRate(),
-      getCurrentBufferSizeSamples() and getXRunCount() read nothing but atomics,
-      so they are safe to call from a realtime thread.
+      getCurrentBufferSizeSamples(), getXRunCount() and getCurrentBitDepth() read
+      nothing but atomics - getCurrentBitDepth() reads nothing at all - so they
+      are safe to call from a realtime thread, provided that the platform
+      implements these atomics lock-free.
 
     - start(), stop(), getOutputLatencyInSamples() and getInputLatencyInSamples()
       take the lifecycle lock. getRoutedOutputDeviceName() doesn't take that
       lock - it only guards its own short-lived cache - but it opens a connection
       of its own and walks the whole graph. None of them may be called from a
-      realtime thread. start() and stop() no longer wait for an in-flight
-      callback of their own (see waitForInFlightCallbacks()), but the lock they
-      take is reason enough by itself. The remaining getters aren't realtime
-      fodder either - several hand back a container by value - so the five above
-      are the whole of the audio-thread interface.
+      realtime thread. start() and stop() no longer wait for the callback
+      running on the calling thread (see waitForInFlightCallbacks()), but the
+      lock they take is reason enough by itself. The remaining getters aren't
+      realtime fodder either - several hand back a container by value - so the
+      six above are the whole of the audio-thread interface.
 
     - The lock can be held for seconds, because the monitor thread keeps it
-      across a rebuild - and a rebuild is what makes an audio-thread caller
-      circular:
+      across the teardown and the stream creation - it is only released while
+      waiting for the streams to start - and a rebuild is what makes an
+      audio-thread caller circular:
 
           data loop   : process callback -> host asks for the latency -> lock
           monitor     : holds the lock -> teardown -> loop thread
@@ -1105,8 +1108,8 @@ public:
     }
 
     //==============================================================================
-    const String& getSinkKey() const     { return sinkKey; }
-    const String& getSourceKey() const   { return sourceKey; }
+    String getSinkKey() const           { return sinkKey; }
+    String getSourceKey() const         { return sourceKey; }
 
 private:
     //==============================================================================
