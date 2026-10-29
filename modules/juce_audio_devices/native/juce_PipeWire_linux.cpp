@@ -95,7 +95,6 @@ static bool loadPipeWireLibrary()
 //==============================================================================
 // Core/context/loop
 JUCE_DECL_VOID_PIPEWIRE_FUNCTION (pw_init, (int* argc, char*** argv), (argc, argv))
-JUCE_DECL_VOID_PIPEWIRE_FUNCTION (pw_deinit, (), ())
 JUCE_DECL_PIPEWIRE_FUNCTION (struct pw_main_loop*, pw_main_loop_new, (const struct spa_dict* props), (props))
 JUCE_DECL_VOID_PIPEWIRE_FUNCTION (pw_main_loop_destroy, (struct pw_main_loop* loop), (loop))
 JUCE_DECL_PIPEWIRE_FUNCTION (struct pw_loop*, pw_main_loop_get_loop, (struct pw_main_loop* loop), (loop))
@@ -152,6 +151,49 @@ static inline struct pw_properties* createEmptyPipeWireProperties()
 }
 
 //==============================================================================
+// pw_init() has to be called before any other PipeWire entry point, and it may
+// rewrite the arguments that it is given the first time around. pw_deinit()
+// used to tear down the process-wide PipeWire state without any reference
+// counting (before 0.3.49), so calling the pair once per connection could pull
+// the library out from under every other PipeWire user in the process (the host
+// application, plugins, other libraries, ...). Both calls are therefore made
+// exactly once for the lifetime of the process, and the library is deliberately
+// never de-initialised afterwards.
+static bool initialisePipeWireLibrary()
+{
+    if (! loadPipeWireLibrary())
+        return false;
+
+    static const bool initialised = []
+    {
+        int fakeArgc = 1;
+        char executableName[] = "juce";
+        char* fakeArgv[] = { executableName, nullptr };
+        char** fakeArgvPtr = fakeArgv;
+        juce::pw_init (&fakeArgc, &fakeArgvPtr);
+        return true;
+    }();
+
+    return initialised;
+}
+
+// True when the calling thread is a JUCE thread that has been asked to stop.
+// The waits in this file can last for several seconds when the server is
+// unresponsive, and this lets them be abandoned promptly instead of having the
+// thread killed while it is in the middle of a PipeWire call.
+static bool isCallingThreadBeingStopped()
+{
+    if (auto* thread = Thread::getCurrentThread())
+        return thread->threadShouldExit();
+
+    return false;
+}
+
+// How long a worker thread is given to leave its loop before we leave it to
+// finish on its own. Threads are never force-killed here.
+static constexpr int threadStopTimeoutMs = 2000;
+
+//==============================================================================
 static const char* getProp (const struct spa_dict* props, const char* key)
 {
     if (props == nullptr)
@@ -196,7 +238,7 @@ public:
     // PipeWire server could not be reached.
     static bool scan (PipeWireScanResult& result)
     {
-        if (! loadPipeWireLibrary())
+        if (! initialisePipeWireLibrary())
             return false;
 
         PipeWireRegistryScanner scanner;
@@ -209,7 +251,7 @@ public:
     // isn't linked, or the graph has changed since the scan).
     static String findRoutedPeerName (uint32_t nodeId, bool nodeIsOutput)
     {
-        if (! loadPipeWireLibrary() || nodeId == SPA_ID_INVALID)
+        if (! initialisePipeWireLibrary() || nodeId == SPA_ID_INVALID)
             return {};
 
         PipeWireRegistryScanner scanner;
@@ -248,8 +290,12 @@ public:
     //==============================================================================
     void handleCoreDone (uint32_t id, int seq)
     {
-        // The seq of a sync reply always has the 1 << 30 bit set.
-        if (id == PW_ID_CORE && (seq & (1 << 30)) != 0)
+        // pw_core_sync() returns the sequence number that the server echoes back
+        // in its done event, so that is what we match on. Relying on the bit
+        // pattern of that number instead would be depending on an undocumented
+        // implementation detail - and if the assumption didn't hold, quit()
+        // would never be called and every scan would stall until it timed out.
+        if (id == PW_ID_CORE && seq == pendingSyncSeq)
             connection.quit();
     }
 
@@ -281,12 +327,13 @@ public:
         else if (String (type) == PW_TYPE_INTERFACE_Port)
         {
             const auto* nodeIdStr = getProp (props, "node.id");
+            uint32_t nodeId = SPA_ID_INVALID;
 
-            if (nodeIdStr != nullptr)
+            if (parseNodeId (nodeIdStr, nodeId))
             {
                 PortRecord port;
                 port.id = id;
-                port.nodeId = (uint32_t) atoi (nodeIdStr);
+                port.nodeId = nodeId;
                 port.channel = String::fromUTF8 (getProp (props, PW_KEY_AUDIO_CHANNEL));
                 port.isInput = String::fromUTF8 (getProp (props, PW_KEY_PORT_DIRECTION)) == "in";
                 ports.add (port);
@@ -300,15 +347,34 @@ public:
         {
             const auto* outputNode = getProp (props, PW_KEY_LINK_OUTPUT_NODE);
             const auto* inputNode  = getProp (props, PW_KEY_LINK_INPUT_NODE);
+            uint32_t outputNodeId = SPA_ID_INVALID, inputNodeId = SPA_ID_INVALID;
 
-            if (outputNode != nullptr && inputNode != nullptr)
+            if (parseNodeId (outputNode, outputNodeId) && parseNodeId (inputNode, inputNodeId))
             {
                 LinkRecord link;
-                link.outputNode = (uint32_t) atoi (outputNode);
-                link.inputNode  = (uint32_t) atoi (inputNode);
+                link.outputNode = outputNodeId;
+                link.inputNode  = inputNodeId;
                 links.add (link);
             }
         }
+    }
+
+    // Node ids are always non-zero decimal numbers - 0 means PW_ID_CORE - so
+    // anything else is rejected rather than being turned into a reference to
+    // the core object.
+    static bool parseNodeId (const char* text, uint32_t& result)
+    {
+        if (text == nullptr || *text == '\0')
+            return false;
+
+        char* end = nullptr;
+        const auto value = std::strtoul (text, &end, 10);
+
+        if (end == text || *end != '\0' || value == 0 || value > (unsigned long) UINT32_MAX)
+            return false;
+
+        result = (uint32_t) value;
+        return true;
     }
 
     void handleMetadataProperty (const char* key, const char* value)
@@ -358,11 +424,22 @@ private:
         // The connection (and everything bound to it, including the metadata
         // proxies) is cleaned up when the PipeWireConnection member is
         // destroyed, so we only need to detach our listeners here.
-        spa_hook_remove (&coreHook);
-        spa_hook_remove (&registryHook);
+        //
+        // Only hooks that were actually registered may be removed:
+        // spa_hook_remove() dereferences a null list head if it is called for a
+        // hook that was never added, which crashes on SPA versions before
+        // 0.3.58 (0.3.55 and earlier called spa_list_remove() unconditionally).
+        // A failed scan - for example on a machine that has libpipewire
+        // installed but no server running - must not take the process down.
+        if (coreHookAdded)
+            spa_hook_remove (&coreHook);
+
+        if (registryHookAdded)
+            spa_hook_remove (&registryHook);
 
         for (auto& binding : metadataBindings)
-            spa_hook_remove (&binding->objectHook);
+            if (binding->hookAdded)
+                spa_hook_remove (&binding->objectHook);
     }
 
     //==============================================================================
@@ -374,6 +451,7 @@ private:
             return false;
 
         juce::pw_core_add_listener (connection.core, &coreHook, &getCoreEvents(), this);
+        coreHookAdded = true;
 
         connection.registry = juce::pw_core_get_registry (connection.core, PW_VERSION_REGISTRY, 0);
 
@@ -381,9 +459,10 @@ private:
             return false;
 
         juce::pw_registry_add_listener (connection.registry, &registryHook, &getRegistryEvents(), this);
+        registryHookAdded = true;
 
         // Wait for the initial burst of globals to arrive.
-        if (juce::pw_core_sync (connection.core, PW_ID_CORE, ++syncCounter) < 0)
+        if (! syncWithServer())
             return false;
 
         if (! connection.runUntilQuit (scanTimeoutMs) || failed)
@@ -399,7 +478,7 @@ private:
         {
             // A final sync ensures that all the property events have arrived
             // before we proceed.
-            if (juce::pw_core_sync (connection.core, PW_ID_CORE, ++syncCounter) < 0)
+            if (! syncWithServer())
                 return false;
 
             if (! connection.runUntilQuit (scanTimeoutMs) || failed)
@@ -409,6 +488,15 @@ private:
         assembleResult();
         resultToFill = result;
         return true;
+    }
+
+    // Requests a round-trip to the server and remembers the sequence number
+    // that it will report back through the done event.
+    bool syncWithServer()
+    {
+        pendingSyncSeq = juce::pw_core_sync (connection.core, PW_ID_CORE, 0);
+
+        return pendingSyncSeq >= 0;
     }
 
     //==============================================================================
@@ -425,61 +513,68 @@ private:
         binding->metadata = metadata;
         juce::pw_proxy_add_object_listener ((struct pw_proxy*) metadata, &binding->objectHook,
                                             &getMetadataEvents(), this);
+        binding->hookAdded = true;
         metadataBindings.add (std::move (binding));
     }
 
     //==============================================================================
+    // These tables are built through a function-local static rather than by
+    // checking a "version == 0" sentinel in place: scans can be started from the
+    // message thread, the device-list watcher and the monitor thread at the same
+    // time, and filling the struct in place would let one of them observe a
+    // half-written table and call a null callback. A function-local static is
+    // initialised exactly once, even under that race.
     static const struct pw_core_events& getCoreEvents()
     {
-        static struct pw_core_events events {};
-
-        if (events.version == 0)
+        static const struct pw_core_events events = []
         {
-            events.version = PW_VERSION_CORE_EVENTS;
-            events.done = [] (void* data, uint32_t id, int seq)
+            struct pw_core_events result {};
+            result.version = PW_VERSION_CORE_EVENTS;
+            result.done = [] (void* data, uint32_t id, int seq)
             {
                 static_cast<PipeWireRegistryScanner*> (data)->handleCoreDone (id, seq);
             };
-            events.error = [] (void* data, uint32_t, int, int, const char*)
+            result.error = [] (void* data, uint32_t, int, int, const char*)
             {
                 static_cast<PipeWireRegistryScanner*> (data)->handleCoreError();
             };
-        }
+            return result;
+        }();
 
         return events;
     }
 
     static const struct pw_registry_events& getRegistryEvents()
     {
-        static struct pw_registry_events events {};
-
-        if (events.version == 0)
+        static const struct pw_registry_events events = []
         {
-            events.version = PW_VERSION_REGISTRY_EVENTS;
-            events.global = [] (void* data, uint32_t id, uint32_t, const char* type,
+            struct pw_registry_events result {};
+            result.version = PW_VERSION_REGISTRY_EVENTS;
+            result.global = [] (void* data, uint32_t id, uint32_t, const char* type,
                                 uint32_t, const struct spa_dict* props)
             {
                 static_cast<PipeWireRegistryScanner*> (data)->handleGlobal (id, type, props);
             };
-            events.global_remove = [] (void*, uint32_t) {};
-        }
+            result.global_remove = [] (void*, uint32_t) {};
+            return result;
+        }();
 
         return events;
     }
 
     static const struct pw_metadata_events& getMetadataEvents()
     {
-        static struct pw_metadata_events events {};
-
-        if (events.version == 0)
+        static const struct pw_metadata_events events = []
         {
-            events.version = PW_VERSION_METADATA_EVENTS;
-            events.property = [] (void* data, uint32_t, const char* key, const char*, const char* value)
+            struct pw_metadata_events result {};
+            result.version = PW_VERSION_METADATA_EVENTS;
+            result.property = [] (void* data, uint32_t, const char* key, const char*, const char* value)
             {
                 static_cast<PipeWireRegistryScanner*> (data)->handleMetadataProperty (key, value);
                 return 0;
             };
-        }
+            return result;
+        }();
 
         return events;
     }
@@ -532,17 +627,20 @@ private:
 
     static String parseDefaultValue (const char* value)
     {
+        if (value == nullptr)
+            return {};
+
         // The default metadata stores values as JSON, e.g. {"name": "..."}.
-        if (auto* namePos = strstr (value, "\"name\""))
+        // This has to go through a real parser: scanning for quotes breaks on
+        // escaped characters or on any other JSON layout, and the fallback
+        // below then silently stops the device from following the session
+        // default.
+        if (auto* object = JSON::parse (String::fromUTF8 (value)).getDynamicObject())
         {
-            if (auto* quote = strchr (namePos, ':'))
-            {
-                if (auto* start = strchr (quote, '"'))
-                {
-                    if (auto* end = strchr (start + 1, '"'))
-                        return String::fromUTF8 (start + 1, (int) (end - start - 1));
-                }
-            }
+            const auto name = object->getProperty ("name");
+
+            if (name.isString() && name.toString().isNotEmpty())
+                return name.toString();
         }
 
         return String::fromUTF8 (value).trim();
@@ -553,24 +651,18 @@ private:
     {
         struct pw_metadata* metadata = nullptr;
         struct spa_hook objectHook {};
+        bool hookAdded = false;
     };
 
     struct PipeWireConnection
     {
-        PipeWireConnection()
-        {
-            int fakeArgc = 1;
-            char fakeArgv[] = { const_cast<char*> ("juce"), nullptr };
-            char** fakeArgvPtr = fakeArgv;
-            juce::pw_init (&fakeArgc, &fakeArgvPtr);
-        }
+        PipeWireConnection() = default;
 
         ~PipeWireConnection()
         {
             if (core != nullptr)        juce::pw_core_disconnect (core);
             if (context != nullptr)     juce::pw_context_destroy (context);
             if (mainLoop != nullptr)    juce::pw_main_loop_destroy (mainLoop);
-            juce::pw_deinit();
         }
 
         bool connect()
@@ -602,6 +694,9 @@ private:
                 if (Time::getMillisecondCounterHiRes() >= deadline)
                     return false;
 
+                if (isCallingThreadBeingStopped())
+                    return false;
+
                 juce::pw_loop_iterate (juce::pw_main_loop_get_loop (mainLoop), 20);
             }
 
@@ -631,9 +726,10 @@ private:
     Array<uint32_t> metadataIds;
     Array<std::unique_ptr<MetadataBinding>> metadataBindings;
     struct spa_hook coreHook {}, registryHook {};
+    bool coreHookAdded = false, registryHookAdded = false;
 
     PipeWireScanResult result;
-    int syncCounter = 0;
+    int pendingSyncSeq = -1;
     bool failed = false;
 
     static constexpr int scanTimeoutMs = 5000;
@@ -685,10 +781,12 @@ public:
     {
         // PipeWire decides the actual block size (its "quantum") at run-time,
         // so like the JACK backend we advertise a range of sensible sizes and
-        // report the real one via getCurrentBufferSizeSamples().
+        // report the real one via getCurrentBufferSizeSamples(). The quantum is
+        // requested through the stream's node.latency property, see
+        // createStream().
         Array<int> sizes;
 
-        for (int n = 16; n <= 8192; n += n < 64 ? 16 : (n < 512 ? 32 : (n < 2048 ? 64 : 128)))
+        for (int n = 16; n <= 8192; n *= 2)
             sizes.add (n);
 
         return sizes;
@@ -702,12 +800,91 @@ public:
                  double sampleRate,
                  int bufferSizeSamples) override
     {
-        const ScopedLock sl (lifecycleLock);
-        return openInternal (inputChannels, outputChannels, sampleRate, bufferSizeSamples);
+        // Taking the host callback out of the picture can block until an
+        // in-flight IO callback returns, and a host that calls back into the
+        // device from within its IO callback must not be able to deadlock
+        // against us, so this happens without the lifecycle lock held.
+        setCallback (nullptr);
+
+        // The monitor thread may be waiting for the lifecycle lock inside
+        // checkGraph(), so it has to be stopped before that lock is taken:
+        // waiting for a thread that is itself waiting for the lock we hold would
+        // stall this call for the whole timeout (and leave the device half shut
+        // down when the wait fails). shuttingDown makes an in-flight scan
+        // abandon its work instead of touching the server objects.
+        shuttingDown = true;
+        stopMonitorThread();
+
+        const auto requestedInputs  = restrictToKnownChannels (inputChannels,  inputChannelNames.size());
+        const auto requestedOutputs = restrictToKnownChannels (outputChannels, outputChannelNames.size());
+
+        String openError;
+
+        if (requestedInputs.isZero() && requestedOutputs.isZero())
+        {
+            openError = "No channels were selected for the PipeWire device";
+        }
+        else if (! initialisePipeWireLibrary())
+        {
+            openError = "PipeWire is not available on this system";
+        }
+        else
+        {
+            // Resolving the target nodes means walking the registry, which is a
+            // server round-trip and can take several seconds when the server is
+            // unresponsive. Like the other waits in this file it happens before
+            // the lifecycle lock is taken, so that a host blocking on the lock
+            // (the latency queries are called from the message thread) is not
+            // held up by it.
+            PipeWireScanResult scanResult;
+
+            if (! PipeWireRegistryScanner::scan (scanResult))
+            {
+                openError = "Could not connect to the PipeWire server";
+            }
+            else
+            {
+                const ScopedLock sl (lifecycleLock);
+                openError = openInternal (requestedInputs, requestedOutputs,
+                                          sampleRate, bufferSizeSamples, scanResult);
+            }
+        }
+
+        if (openError.isNotEmpty())
+        {
+            // The monitor thread has already been stopped and shuttingDown is
+            // set, so the device has to be left properly closed instead of half
+            // open.
+            close();
+            setLastError (openError);
+            return openError;
+        }
+
+        // Waiting for the server must not happen while the lifecycle lock is
+        // held: the same lock is taken by close(), by the latency queries and
+        // by the monitor thread, and the wait can take several seconds.
+        if (! waitForStreamsToStart())
+        {
+            const auto error = getLastErrorCopy();
+            close();
+            return error;
+        }
+
+        startMonitorThread();
+        return {};
     }
 
     void close() override
     {
+        setCallback (nullptr);
+
+        // See open(): the monitor thread is stopped before the lifecycle lock is
+        // taken, because it may be blocked waiting for that same lock inside
+        // checkGraph(). Waiting for it while holding the lock would stall
+        // close() for the whole timeout.
+        shuttingDown = true;
+        stopMonitorThread();
+
         const ScopedLock sl (lifecycleLock);
         closeInternal();
     }
@@ -719,21 +896,27 @@ public:
     //==============================================================================
     void start (AudioIODeviceCallback* newCallback) override
     {
-        const ScopedLock sl (lifecycleLock);
-
         if (! isOpen_.load())
             newCallback = nullptr;
 
-        if (newCallback != callback.load())
+        if (newCallback == callback.load (std::memory_order_acquire))
         {
-            if (newCallback != nullptr)
-                newCallback->audioDeviceAboutToStart (this);
-
-            setCallback (newCallback);
-
-            if (newCallback != nullptr)
-                xruns = 0;
+            const ScopedLock sl (lifecycleLock);
+            setActive (callback.load() != nullptr);
+            return;
         }
+
+        if (newCallback != nullptr)
+            newCallback->audioDeviceAboutToStart (this);
+
+        // Swapping the callback waits for any in-flight IO callback to return,
+        // so it has to happen outside of the lifecycle lock - see setCallback().
+        setCallback (newCallback);
+
+        const ScopedLock sl (lifecycleLock);
+
+        if (callback.load() != nullptr)
+            xruns = 0;
 
         setActive (callback.load() != nullptr);
     }
@@ -755,7 +938,7 @@ public:
     {
         const ScopedLock sl (lifecycleLock);
 
-        auto latency = playbackStream != nullptr ? getLatencyInSamples (playbackStream->stream) : 0;
+        auto latency = playbackStream != nullptr ? getLatencyInSamples (playbackStream->stream, currentSampleRate.load()) : 0;
 
         // Input data is handed to the callback one block after capture, so add
         // an extra block of latency when doing full-duplex I/O.
@@ -769,7 +952,7 @@ public:
     {
         const ScopedLock sl (lifecycleLock);
 
-        auto latency = captureStream != nullptr ? getLatencyInSamples (captureStream->stream) : 0;
+        auto latency = captureStream != nullptr ? getLatencyInSamples (captureStream->stream, currentSampleRate.load()) : 0;
 
         if (playbackStream != nullptr && captureStream != nullptr)
             latency += jmax (1, getCurrentBufferSizeSamples());
@@ -808,8 +991,6 @@ private:
         struct spa_hook listener {};
         bool isCapture = false;
         int numChannels = 0;
-        uint32_t nodeId = SPA_ID_INVALID;
-        std::atomic<bool> isReady { false };
     };
 
     //==============================================================================
@@ -849,23 +1030,87 @@ private:
     }
 
     //==============================================================================
-    // Swaps the callback and makes sure that the previous callback isn't being
-    // invoked anymore before the swap completes.
-    void setCallback (AudioIODeviceCallback* newCallback)
+    // Detaches the current callback. No new IO callback can start once this has
+    // returned. The caller still has to call waitForInFlightCallbacks() before
+    // it notifies the detached callback, and that wait must happen without any
+    // lock held - see setCallback().
+    AudioIODeviceCallback* detachCallback()
     {
         callbackGeneration.fetch_add (1, std::memory_order_acq_rel);
-        auto* const oldCallback = callback.exchange (nullptr, std::memory_order_acq_rel);
+        return callback.exchange (nullptr, std::memory_order_acq_rel);
+    }
 
-        // No new invocations can start now, so wait for the running ones.
+    // Waits until the IO callbacks that were already running have returned.
+    //
+    // This must never be called while holding a lock that an IO callback can
+    // take: the host is allowed to call back into the device (start(), stop(),
+    // close(), the latency queries) from within its IO callback, and a host that
+    // does so would otherwise wait for the very callback this is waiting for.
+    void waitForInFlightCallbacks() const
+    {
         while (activeCallbacks.load (std::memory_order_acquire) != 0)
             Thread::sleep (1);
+    }
 
-        if (oldCallback != nullptr)
-            oldCallback->audioDeviceStopped();
-
+    // Starts invoking the given callback. Must be paired with a preceding
+    // detachCallback() call, and must be called under the callback lock.
+    void attachCallback (AudioIODeviceCallback* newCallback)
+    {
         callback.store (newCallback, std::memory_order_release);
         callbackGeneration.fetch_add (1, std::memory_order_acq_rel);
         isPlaying_ = (newCallback != nullptr);
+    }
+
+    // Swaps the callback and makes sure that the previous callback isn't being
+    // invoked anymore before the swap completes.
+    //
+    // This may block until a host IO callback returns, so it must never be
+    // called while the lifecycle lock is held, and the wait is done without the
+    // callback lock held: see waitForInFlightCallbacks().
+    void setCallback (AudioIODeviceCallback* newCallback)
+    {
+        AudioIODeviceCallback* oldCallback = nullptr;
+
+        {
+            const ScopedLock sl (callbackLock);
+            oldCallback = detachCallback();
+        }
+
+        waitForInFlightCallbacks();
+
+        {
+            const ScopedLock sl (callbackLock);
+            attachCallback (newCallback);
+        }
+
+        if (oldCallback != nullptr)
+            oldCallback->audioDeviceStopped();
+    }
+
+    // Stops the host callback and tells it about an error. The callback is
+    // detached - and therefore guaranteed not to receive any further IO
+    // callbacks - before it is notified, and it is notified without the lock
+    // held: hosts are expected to be able to restart the device from their
+    // error handler.
+    //
+    // Only audioDeviceError() is sent: the host may destroy its callback, or
+    // restart the device with a different one, from inside the error handler,
+    // so following it up with audioDeviceStopped() could reach a callback that
+    // is either gone or running again. The other backends take the same
+    // approach.
+    void notifyHostStopped (const String& message)
+    {
+        AudioIODeviceCallback* stoppedCallback = nullptr;
+
+        {
+            const ScopedLock sl (callbackLock);
+            stoppedCallback = detachCallback();
+        }
+
+        waitForInFlightCallbacks();
+
+        if (stoppedCallback != nullptr)
+            stoppedCallback->audioDeviceError (message);
     }
 
     // Invokes the JUCE callback without allocating or locking. If the callback
@@ -933,43 +1178,30 @@ private:
     }
 
     //==============================================================================
-    String openInternal (const BigInteger& inputChannels,
-                         const BigInteger& outputChannels,
+    String openInternal (const BigInteger& requestedInputs,
+                         const BigInteger& requestedOutputs,
                          double sampleRate,
-                         int bufferSizeSamples)
+                         int bufferSizeSamples,
+                         const PipeWireScanResult& scanResult)
     {
         closeInternal();
+
+        // If the previous teardown couldn't stop the worker threads, the server
+        // objects are still alive: opening again would create a second set of
+        // streams on top of them.
+        if (audioThread != nullptr || monitorThread != nullptr)
+        {
+            setLastError ("The PipeWire device is still shutting down");
+            return getLastErrorCopy();
+        }
 
         requestedSampleRate = sampleRate > 0 ? sampleRate : 48000.0;
         requestedBufferSize = bufferSizeSamples > 0 ? bufferSizeSamples : getDefaultBufferSize();
 
-        enabledInputChannels  = restrictToKnownChannels (inputChannels,  inputChannelNames.size());
-        enabledOutputChannels = restrictToKnownChannels (outputChannels, outputChannelNames.size());
-
-        if (enabledInputChannels.isZero() && enabledOutputChannels.isZero())
-        {
-            setLastError ("No channels were selected for the PipeWire device");
-            return getLastErrorCopy();
-        }
+        enabledInputChannels  = requestedInputs;
+        enabledOutputChannels = requestedOutputs;
 
         setLastError ({});
-
-        if (! loadPipeWireLibrary())
-        {
-            setLastError ("PipeWire is not available on this system");
-            return getLastErrorCopy();
-        }
-
-        // Resolve the ids of the requested nodes. Node ids can change when the
-        // server restarts or devices are unplugged, so we always re-scan before
-        // opening the device.
-        PipeWireScanResult scanResult;
-
-        if (! PipeWireRegistryScanner::scan (scanResult))
-        {
-            setLastError ("Could not connect to the PipeWire server");
-            return getLastErrorCopy();
-        }
 
         if (! resolveTargets (scanResult))
             return getLastErrorCopy();
@@ -1011,7 +1243,7 @@ private:
         isPlaying_ = false;
         xruns = 0;
 
-        startMonitorThread();
+        // The monitor thread is started by open() once the streams are running.
         return {};
     }
 
@@ -1020,10 +1252,21 @@ private:
         shuttingDown = true;
 
         stopMonitorThread();
-        setCallback (nullptr);
         setActive (false);
 
-        teardownServerObjects();
+        // The caller has already detached the host callback, so no IO callback
+        // can start while the server objects are being destroyed. The loop
+        // thread still has to be given a chance to leave pw_loop_iterate().
+        bool tornDown = false;
+
+        for (int attempt = 0; attempt < 3 && ! tornDown; ++attempt)
+            tornDown = teardownServerObjects();
+
+        if (! tornDown)
+        {
+            JUCE_PIPEWIRE_LOG ("the PipeWire loop thread did not stop; "
+                               "deferring the server object teardown");
+        }
 
         outputPtrs.free();
         inputPtrs.free();
@@ -1050,10 +1293,16 @@ private:
         pendingLostNotify = false;
         needsRebuildAfterLoss = false;
         pendingErrorNotify = false;
+        clearRebuildBackoff();
 
         isOpen_ = false;
         isPlaying_ = false;
-        shuttingDown = false;
+
+        // Only lift the shutdown flag once the loop and monitor threads are
+        // really gone: while they are still running, the process callbacks must
+        // stay inert so that they don't touch the buffers freed above, and the
+        // monitor thread must not restart the server objects behind our back.
+        shuttingDown = (audioThread != nullptr || monitorThread != nullptr);
     }
 
     //==============================================================================
@@ -1125,29 +1374,78 @@ private:
         juce::pw_core_add_listener (pwCore, &coreListener, &getDeviceCoreEvents(), this);
 
         // The loop thread dispatches PipeWire's messages, including the
-        // replies that pw_stream_connect() and pw_loop_invoke() wait for.
+        // replies that pw_stream_connect() waits for.
         audioThread = std::make_unique<AudioThread> (*this);
         audioThread->startThread (Thread::Priority::high);
         return true;
     }
 
-    void teardownServerObjects()
+    // Runs on the loop thread - see teardownServerObjects().
+    static int destroyStreamsOnLoopThread (struct spa_loop*, bool, uint32_t,
+                                           const void*, size_t, void* userData)
     {
+        static_cast<PipeWireAudioIODevice*> (userData)->destroyStreamObjects();
+        return 0;
+    }
+
+    // Returns false if the loop thread is still running, in which case nothing
+    // that depends on the loop may be destroyed and the caller has to try again
+    // later.
+    bool teardownServerObjects()
+    {
+        // The streams have to be destroyed while the loop is still being
+        // pumped, and never concurrently with the dispatch of their own
+        // callbacks:
+        //
+        // - PipeWire marshals proxy messages through the loop and blocks until
+        //   the loop thread has processed them. Destroying a stream from here
+        //   after the loop thread has been stopped therefore never returns
+        //   (measured: pw_stream_destroy() with a stopped loop hangs forever,
+        //   with a running loop it returns in microseconds).
+        // - pw_stream_destroy() frees the stream object on the calling thread,
+        //   so destroying it while the loop thread is inside that stream's
+        //   process callback frees the pw_stream (and then the StreamData that
+        //   is handed to the callback) from under it.
+        //
+        // Running the destroy on the loop itself satisfies both: it is
+        // serialised with the dispatch of the callbacks, and the loop keeps
+        // running while this thread waits for it.
+        if (playbackStream != nullptr || captureStream != nullptr)
+        {
+            if (audioThread != nullptr && pwLoop != nullptr && audioThread->isThreadRunning())
+            {
+                juce::pw_loop_invoke (pwLoop, destroyStreamsOnLoopThread, 0, nullptr, 0, true, this);
+            }
+            else
+            {
+                // There is no thread pumping the loop, so the destroy would
+                // block forever. This can only happen if the loop thread had
+                // to be abandoned, and dropping the connection below tears the
+                // streams down on the server side anyway.
+                JUCE_PIPEWIRE_LOG ("no loop thread: leaving the streams to the server");
+            }
+        }
+
         if (audioThread != nullptr)
         {
-            // Stream destruction must happen on the loop thread.
-            destroyStreamObjectsOnLoopThread();
+            // Everything that had to run on the loop has run, so the thread can
+            // be stopped. waitForThreadToExit() is used rather than stopThread():
+            // the latter force-kills the thread (with pthread_cancel) once the
+            // timeout expires, which can leave PipeWire's internal locks in an
+            // inconsistent state.
+            audioThread->signalThreadShouldExit();
 
-            audioThread->stopThread (2000);
+            if (! audioThread->waitForThreadToExit (loopThreadStopTimeoutMs))
+                return false;
+
             audioThread.reset();
-        }
-        else
-        {
-            destroyStreamObjectsOnLoop();
         }
 
         if (pwCore != nullptr)
         {
+            // The listener was registered in setupServerObjects() as soon as the
+            // connection succeeded, so it is always safe to remove it here.
+            spa_hook_remove (&coreListener);
             juce::pw_core_disconnect (pwCore);
             pwCore = nullptr;
         }
@@ -1163,6 +1461,8 @@ private:
             juce::pw_loop_destroy (pwLoop);
             pwLoop = nullptr;
         }
+
+        return true;
     }
 
     //==============================================================================
@@ -1170,7 +1470,15 @@ private:
     {
         streamsStartedEvent.reset();
 
-        if (! enabledOutputChannels.isZero())
+        // These flags are published before any stream exists, so that the state
+        // changed callbacks - which run on the loop thread - never have to look
+        // at the stream pointers to work out whether both streams are running.
+        wantPlaybackStream = ! enabledOutputChannels.isZero();
+        wantCaptureStream  = ! enabledInputChannels.isZero();
+        playbackStreamReady = false;
+        captureStreamReady = false;
+
+        if (wantPlaybackStream)
         {
             playbackStream = std::make_unique<StreamData>();
             playbackStream->owner = this;
@@ -1178,7 +1486,7 @@ private:
             playbackStream->numChannels = enabledOutputChannels.countNumberOfSetBits();
         }
 
-        if (! enabledInputChannels.isZero())
+        if (wantCaptureStream)
         {
             captureStream = std::make_unique<StreamData>();
             captureStream->owner = this;
@@ -1200,10 +1508,9 @@ private:
         if (captureStream != nullptr && ! connectStream (*captureStream, sourceNodeId))
             return false;
 
-        if (! waitForStreamsToStart())
-            return false;
-
-        // Preallocate everything the process callbacks need.
+        // Preallocate everything the process callbacks need. This has to happen
+        // before the streams are activated, which is the caller's job once
+        // waitForStreamsToStart() has returned.
         const int outChans = enabledOutputChannels.countNumberOfSetBits();
         const int inChans  = enabledInputChannels.countNumberOfSetBits();
 
@@ -1237,6 +1544,20 @@ private:
         juce::pw_properties_set (props, PW_KEY_NODE_NAME, clientName.toRawUTF8());
         juce::pw_properties_set (props, PW_KEY_NODE_DESCRIPTION, clientName.toRawUTF8());
 
+        // Ask the server to schedule us with the requested block size. Without
+        // this the graph's default quantum is used and the buffer size that the
+        // host asked for is silently ignored, so getCurrentBufferSizeSamples()
+        // would never match getDefaultBufferSize() / the value passed to open().
+        // The latency is a fraction of a second, expressed as frames/rate.
+        const auto latency = String (jmax (1, requestedBufferSize)) + "/"
+                               + String (jmax (1, (int) requestedSampleRate));
+        juce::pw_properties_set (props, PW_KEY_NODE_LATENCY, latency.toRawUTF8());
+
+        // ... and let the server know which rate we would like the graph to run
+        // at when it can be changed.
+        const auto requestedRate = "1/" + String (jmax (1, (int) requestedSampleRate));
+        juce::pw_properties_set (props, PW_KEY_NODE_RATE, requestedRate.toRawUTF8());
+
         data.stream = juce::pw_stream_new (pwCore, clientName.toRawUTF8(), props);
 
         if (data.stream == nullptr)
@@ -1252,30 +1573,76 @@ private:
 
     bool connectStream (StreamData& data, uint32_t targetId)
     {
-        // Build a format pod requesting floating point, non-interleaved audio.
-        uint8_t podBuffer[512];
+        // Build the format pods requesting floating point, non-interleaved
+        // audio. The buffer is sized for the maximum number of formats and
+        // channels that can be offered below (a format pod is roughly 60 bytes
+        // plus 4 bytes per channel position); a pod that doesn't fit makes the
+        // builder return nullptr, which is handled by stopping early.
+        uint8_t podBuffer[8192];
         auto builder = SPA_POD_BUILDER_INIT (podBuffer, sizeof podBuffer);
 
         struct spa_audio_info_raw info {};
         info.format = SPA_AUDIO_FORMAT_F32P;
         info.channels = (uint32_t) data.numChannels;
-        info.rate = (uint32_t) requestedSampleRate;
 
         // Preserve the channel positions selected by the caller.
         const auto& channelNames = data.isCapture ? inputChannelNames : outputChannelNames;
         const auto& enabledChannels = data.isCapture ? enabledInputChannels : enabledOutputChannels;
         int position = 0;
 
-        for (int channel = 0; channel < channelNames.size() && position < SPA_AUDIO_MAX_CHANNELS; ++channel)
+        for (int channel = 0; channel < channelNames.size() && position < (int) SPA_AUDIO_MAX_CHANNELS; ++channel)
             if (enabledChannels[channel])
-                info.position[position++] = spa_type_audio_channel_from_short_name (channelNames[channel].toRawUTF8());
+                info.position[position++] = getChannelPosition (channelNames[channel]);
 
-        const struct spa_pod* params[1];
-        params[0] = spa_format_audio_raw_build (&builder, SPA_PARAM_EnumFormat, &info);
+        // Offer a wider set of sample rates - the requested one first - so that
+        // a device that can't run at the requested rate is negotiated down
+        // instead of failing to open. This list is what
+        // getAvailableSampleRates() advertises; anything missing here would be
+        // silently replaced by one of the offered rates. The negotiated rate is
+        // reported back through param_changed.
+        const double offeredRates[] = { requestedSampleRate,
+                                        8000.0, 11025.0, 12000.0, 16000.0, 22050.0, 24000.0, 32000.0,
+                                        44100.0, 48000.0, 64000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
+        constexpr uint32_t maxNumFormats = (uint32_t) numElementsInArray (offeredRates);
+
+        const struct spa_pod* params[maxNumFormats];
+        uint32_t numParams = 0;
+
+        for (auto rate : offeredRates)
+        {
+            if (numParams == maxNumFormats)
+                break;
+
+            const auto rateToUse = (uint32_t) jmax (1.0, rate);
+
+            // Skip duplicates of rates that were already added.
+            bool duplicate = false;
+
+            for (uint32_t i = 0; i < numParams; ++i)
+                if (offeredRateMatches (params[i], rateToUse))
+                    duplicate = true;
+
+            if (duplicate)
+                continue;
+
+            info.rate = rateToUse;
+            params[numParams] = spa_format_audio_raw_build (&builder, SPA_PARAM_EnumFormat, &info);
+
+            if (params[numParams] == nullptr)
+                break;
+
+            ++numParams;
+        }
+
+        if (numParams == 0)
+        {
+            setLastError ("Could not build the PipeWire audio format");
+            return false;
+        }
 
         const auto direction = data.isCapture ? PW_DIRECTION_INPUT : PW_DIRECTION_OUTPUT;
         const auto flags = (enum pw_stream_flags) (PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS);
-        const auto result = juce::pw_stream_connect (data.stream, direction, targetId, flags, params, 1);
+        const auto result = juce::pw_stream_connect (data.stream, direction, targetId, flags, params, numParams);
 
         if (result < 0)
         {
@@ -1289,33 +1656,68 @@ private:
         return true;
     }
 
+    static bool offeredRateMatches (const struct spa_pod* param, uint32_t rate)
+    {
+        if (param == nullptr)
+            return false;
+
+        struct spa_audio_info_raw parsed {};
+
+        return spa_format_audio_raw_parse (param, &parsed) >= 0 && parsed.rate == rate;
+    }
+
+    // PipeWire names the channels of its ports with the short names ("FL",
+    // "FR", ...), but a device created through the JUCE API may also use the
+    // longer JUCE names. Both are accepted, and anything unknown falls back to
+    // SPA_AUDIO_CHANNEL_UNKNOWN, which lets the server pick a sensible layout.
+    static uint32_t getChannelPosition (const String& channelName)
+    {
+        const auto shortName = spa_type_audio_channel_from_short_name (channelName.toRawUTF8());
+
+        if (shortName != SPA_AUDIO_CHANNEL_UNKNOWN)
+            return shortName;
+
+        if (channelName == "Left")              return SPA_AUDIO_CHANNEL_FL;
+        if (channelName == "Right")             return SPA_AUDIO_CHANNEL_FR;
+        if (channelName == "Centre"
+             || channelName == "Center")        return SPA_AUDIO_CHANNEL_FC;
+        if (channelName == "LFE")               return SPA_AUDIO_CHANNEL_LFE;
+        if (channelName == "Side Left")         return SPA_AUDIO_CHANNEL_SL;
+        if (channelName == "Side Right")        return SPA_AUDIO_CHANNEL_SR;
+        if (channelName == "Back Left")         return SPA_AUDIO_CHANNEL_RL;
+        if (channelName == "Back Right")        return SPA_AUDIO_CHANNEL_RR;
+
+        return SPA_AUDIO_CHANNEL_UNKNOWN;
+    }
+
     bool waitForStreamsToStart()
     {
-        if (! streamsStartedEvent.wait (10000))
-            setLastError ("Timed out waiting for the PipeWire server to start the streams");
+        const auto deadline = Time::getMillisecondCounterHiRes() + (double) streamStartTimeoutMs;
 
-        return getLastErrorCopy().isEmpty();
+        // Waiting in short slices keeps this responsive to a calling thread that
+        // is being asked to stop - the monitor thread can end up here during a
+        // rebuild, and it must not have to be killed to get out.
+        while (Time::getMillisecondCounterHiRes() < deadline)
+        {
+            if (streamsStartedEvent.wait (50))
+                return getLastErrorCopy().isEmpty();
+
+            if (isCallingThreadBeingStopped())
+            {
+                setLastError ("The PipeWire device is shutting down");
+                return false;
+            }
+        }
+
+        setLastError ("Timed out waiting for the PipeWire server to start the streams");
+        return false;
     }
 
     //==============================================================================
-    static int destroyStreamsCallback (struct spa_loop*, bool, uint32_t, const void*, size_t, void* userData)
-    {
-        static_cast<PipeWireAudioIODevice*> (userData)->destroyStreamObjectsOnLoop();
-        return 0;
-    }
-
-    void destroyStreamObjectsOnLoopThread()
-    {
-        if (pwLoop == nullptr)
-        {
-            destroyStreamObjectsOnLoop();
-            return;
-        }
-
-        juce::pw_loop_invoke (pwLoop, &destroyStreamsCallback, 1, nullptr, 0, true, this);
-    }
-
-    void destroyStreamObjectsOnLoop()
+    // Only ever called from the loop thread (via destroyStreamsOnLoopThread), so
+    // no callback for the streams being destroyed can be running at the same
+    // time - see teardownServerObjects().
+    void destroyStreamObjects()
     {
         if (playbackStream != nullptr)
         {
@@ -1333,6 +1735,10 @@ private:
             captureStream.reset();
         }
 
+        wantPlaybackStream = false;
+        wantCaptureStream = false;
+        playbackStreamReady = false;
+        captureStreamReady = false;
         playbackNodeId = SPA_ID_INVALID;
         captureNodeId = SPA_ID_INVALID;
     }
@@ -1349,46 +1755,49 @@ private:
     }
 
     //==============================================================================
+    // Built through a function-local static for the same reason as the scanner's
+    // tables - see getCoreEvents() there. These are used from the loop thread and
+    // from the control thread.
     static const struct pw_stream_events& getStreamEvents()
     {
-        static struct pw_stream_events events {};
-
-        if (events.version == 0)
+        static const struct pw_stream_events events = []
         {
-            events.version = PW_VERSION_STREAM_EVENTS;
-            events.state_changed = [] (void* data, enum pw_stream_state /* oldState */,
+            struct pw_stream_events result {};
+            result.version = PW_VERSION_STREAM_EVENTS;
+            result.state_changed = [] (void* data, enum pw_stream_state /* oldState */,
                                        enum pw_stream_state state, const char* error)
             {
                 auto& streamData = *static_cast<StreamData*> (data);
                 streamData.owner->handleStreamStateChanged (streamData, state, error);
             };
-            events.param_changed = [] (void* data, uint32_t, const struct spa_pod* param)
+            result.param_changed = [] (void* data, uint32_t, const struct spa_pod* param)
             {
                 auto& streamData = *static_cast<StreamData*> (data);
                 streamData.owner->handleStreamParamChanged (param);
             };
-            events.process = [] (void* data)
+            result.process = [] (void* data)
             {
                 auto& streamData = *static_cast<StreamData*> (data);
                 streamData.owner->handleStreamProcess (streamData);
             };
-        }
+            return result;
+        }();
 
         return events;
     }
 
     static const struct pw_core_events& getDeviceCoreEvents()
     {
-        static struct pw_core_events events {};
-
-        if (events.version == 0)
+        static const struct pw_core_events events = []
         {
-            events.version = PW_VERSION_CORE_EVENTS;
-            events.error = [] (void* data, uint32_t, int, int, const char*)
+            struct pw_core_events result {};
+            result.version = PW_VERSION_CORE_EVENTS;
+            result.error = [] (void* data, uint32_t, int, int, const char*)
             {
                 static_cast<PipeWireAudioIODevice*> (data)->handleServerLost();
             };
-        }
+            return result;
+        }();
 
         return events;
     }
@@ -1423,8 +1832,11 @@ private:
 
             if (! streamErrorNotified.exchange (true))
             {
+                // Resume after recovery only if the host still had us playing,
+                // mirroring notifyServerLost(): a stream that fails while the
+                // device is idle must not make it start playing on its own.
+                resumeAfterRecovery = isPlaying_.load();
                 isPlaying_ = false;
-                resumeAfterRecovery = true;
 
                 // The monitor thread notifies the host and rebuilds the
                 // streams; user callbacks are never invoked from here.
@@ -1439,10 +1851,17 @@ private:
         if (state == PW_STREAM_STATE_PAUSED)
         {
             refreshStreamNodeId (data);
-            data.isReady = true;
 
-            const bool allStreamsReady = (playbackStream == nullptr || playbackStream->isReady.load())
-                                      && (captureStream  == nullptr || captureStream->isReady.load());
+            if (data.isCapture)
+                captureStreamReady = true;
+            else
+                playbackStreamReady = true;
+
+            // This runs on the loop thread and only reads atomics: the control
+            // thread may still be publishing the other stream, so the stream
+            // pointers must not be dereferenced from here.
+            const bool allStreamsReady = (! wantPlaybackStream.load() || playbackStreamReady.load())
+                                      && (! wantCaptureStream.load()  || captureStreamReady.load());
 
             if (allStreamsReady)
                 streamsStartedEvent.signal();
@@ -1455,8 +1874,6 @@ private:
 
         if (nodeId == SPA_ID_INVALID)
             return;
-
-        data.nodeId = nodeId;
 
         if (data.isCapture)
             captureNodeId = nodeId;
@@ -1597,7 +2014,10 @@ private:
             if (captureBuffer.getNumSamples() < numSamples)
             {
                 // The capture buffer is smaller than the playback block, which
-                // shouldn't normally happen. Discard the captured data.
+                // shouldn't normally happen. Discard the captured data and hand
+                // the host silence - the buffer may still hold the previous
+                // block, and passing that on would repeat a chunk of audio.
+                captureBuffer.clear (0, numSamples);
                 captureSamples = 0;
                 xruns++;
             }
@@ -1656,7 +2076,13 @@ private:
 
         // If we're only recording, drive the callback directly from here,
         // otherwise store the data for the next playback block.
-        if (playbackStream == nullptr)
+        //
+        // This runs on the loop thread, while the playback stream is created and
+        // destroyed by the control thread, so the atomic flag is used as the
+        // criterion rather than the pointer itself: it is set before either
+        // stream is connected (which is the earliest a capture callback can
+        // arrive) and cleared only once the loop thread has stopped.
+        if (! wantPlaybackStream.load())
         {
             currentBufferSize = numSamples;
 
@@ -1689,16 +2115,25 @@ private:
     }
 
     //==============================================================================
-    static int getLatencyInSamples (struct pw_stream* stream)
+    static int getLatencyInSamples (struct pw_stream* stream, double sampleRateForStream)
     {
         struct pw_time time {};
 
-        // The rate fraction describes the duration of one tick, so the delay
-        // value is already expressed in samples.
-        if (juce::pw_stream_get_time (stream, &time) == 0 && time.delay > 0)
-            return (int) time.delay;
+        if (juce::pw_stream_get_time (stream, &time) != 0 || time.delay <= 0)
+            return 0;
 
-        return 0;
+        // pw_time.delay is expressed in ticks, and the duration of a tick is
+        // given by the rate fraction (documented as "usually 1/<samplerate>").
+        // Assuming that a tick is always one sample would be out by a large
+        // factor whenever the stream is running at a different rate from the
+        // graph, so convert explicitly.
+        if (time.rate.num == 0 || time.rate.denom == 0 || sampleRateForStream <= 0.0)
+            return 0;
+
+        const auto delaySeconds = (double) time.delay * (double) time.rate.num / (double) time.rate.denom;
+        const auto delaySamples = delaySeconds * sampleRateForStream;
+
+        return (int) jlimit (0.0, (double) std::numeric_limits<int>::max(), delaySamples);
     }
 
     //==============================================================================
@@ -1766,7 +2201,26 @@ private:
     {
         if (monitorThread != nullptr)
         {
-            monitorThread->stopThread (2000);
+            // A host that closes the device from within its audioDeviceError()
+            // handler would get here from the monitor thread itself, and waiting
+            // for a thread to stop from inside that thread would deadlock.
+            if (monitorThread->getThreadId() == Thread::getCurrentThreadId())
+            {
+                monitorThread->signalThreadShouldExit();
+                return;
+            }
+
+            // waitForThreadToExit() rather than stopThread(): the latter
+            // force-kills the thread once the timeout expires, and a monitor
+            // thread that is killed in the middle of a PipeWire call could leave
+            // the library's internal state inconsistent. The scans and the
+            // stream start waits abandon themselves once the thread has been
+            // asked to stop.
+            monitorThread->signalThreadShouldExit();
+
+            if (! monitorThread->waitForThreadToExit (threadStopTimeoutMs))
+                return; // it will finish on its own and be cleaned up later
+
             monitorThread.reset();
         }
     }
@@ -1788,15 +2242,27 @@ private:
                 pendingLostNotify = true;
 
             needsRebuildAfterLoss = true;
+            scheduleRebuildRetry();
             return;
         }
 
         serverLost = false;
 
         // Recover from a server restart, or from a stream error, by rebuilding
-        // the server-side objects.
-        if (needsRebuildAfterLoss || pendingRestart.exchange (false) || resumeAfterRecovery.load())
+        // the server-side objects. Retries are spaced out: while the server is
+        // coming back up, reconnecting once per monitor cycle would hammer it
+        // and keep the lifecycle lock permanently busy.
+        const bool rebuildPending = needsRebuildAfterLoss.load()
+                                      || pendingRestart.load()
+                                      || resumeAfterRecovery.load();
+
+        if (rebuildPending)
         {
+            if (! canAttemptRebuild())
+                return;
+
+            pendingRestart = false;
+
             uint32_t newSink = sinkNodeId;
             uint32_t newSource = sourceNodeId;
 
@@ -1811,7 +2277,10 @@ private:
                 if (auto id = findNodeId (scanResult.sinks, key); id != SPA_ID_INVALID)
                     newSink = id;
                 else
+                {
+                    scheduleRebuildRetry();
                     return;
+                }
             }
 
             if (sourceKey.isNotEmpty())
@@ -1822,13 +2291,19 @@ private:
                 if (auto id = findNodeId (scanResult.sources, key); id != SPA_ID_INVALID)
                     newSource = id;
                 else
+                {
+                    scheduleRebuildRetry();
                     return;
+                }
             }
 
             needsRebuildAfterLoss = false;
             setCurrentDefaultSinkKey (scanResult.defaultSinkKey);
             setCurrentDefaultSourceKey (scanResult.defaultSourceKey);
-            restartServerSide (newSink, newSource, true);
+
+            if (! restartServerSide (newSink, newSource, true))
+                scheduleRebuildRetry();
+
             return;
         }
 
@@ -1840,7 +2315,10 @@ private:
             if (auto id = findNodeId (scanResult.sinks, scanResult.defaultSinkKey); id != SPA_ID_INVALID)
             {
                 setCurrentDefaultSinkKey (scanResult.defaultSinkKey);
-                restartServerSide (id, sourceNodeId, false);
+
+                if (! restartServerSide (id, sourceNodeId, false))
+                    scheduleRebuildRetry();
+
                 return;
             }
         }
@@ -1852,118 +2330,183 @@ private:
             if (auto id = findNodeId (scanResult.sources, scanResult.defaultSourceKey); id != SPA_ID_INVALID)
             {
                 setCurrentDefaultSourceKey (scanResult.defaultSourceKey);
-                restartServerSide (sinkNodeId, id, false);
+
+                if (! restartServerSide (sinkNodeId, id, false))
+                    scheduleRebuildRetry();
             }
         }
     }
 
-    // Must be called with the lifecycleLock held: that guarantees the
-    // callback pointer can't be swapped while we notify the host.
-    void notifyHostStopped (const String& message)
+    //==============================================================================
+    // A failed rebuild is retried with an exponentially growing delay (capped at
+    // maxRebuildBackoffMs) so that a server that is down doesn't get hammered
+    // once per monitor cycle.
+    bool canAttemptRebuild() const
     {
-        if (auto* cb = callback.load (std::memory_order_acquire))
-        {
-            cb->audioDeviceError (message);
-            cb->audioDeviceStopped();
-        }
+        return Time::getMillisecondCounterHiRes() >= nextRebuildAttemptTime;
     }
 
+    void scheduleRebuildRetry()
+    {
+        nextRebuildAttemptTime = Time::getMillisecondCounterHiRes() + (double) rebuildBackoffMs;
+        rebuildBackoffMs = jmin (rebuildBackoffMs * 2, maxRebuildBackoffMs);
+    }
+
+    void clearRebuildBackoff()
+    {
+        nextRebuildAttemptTime = 0.0;
+        rebuildBackoffMs = 1000;
+    }
+
+    // Tells the host that the connection to the server has been lost. The host
+    // is notified without the lifecycle lock held: it is allowed to call back
+    // into the device (for example to switch devices) from its error handler.
     void notifyServerLost()
     {
-        if (! lifecycleLock.tryEnter())
-            return;
-
-        struct Unlocker
         {
-            ~Unlocker() { lock.exit(); }
-            CriticalSection& lock;
-        } unlocker { lifecycleLock };
+            const ScopedLock sl (lifecycleLock);
 
-        setLastError ("Lost the connection to the PipeWire server");
-        resumeAfterRecovery = isPlaying_.load();
-        isPlaying_ = false;
-        pendingLostNotify = false;
+            if (! pendingLostNotify.exchange (false))
+                return;
+
+            setLastError ("Lost the connection to the PipeWire server");
+            resumeAfterRecovery = isPlaying_.load();
+            isPlaying_ = false;
+        }
 
         notifyHostStopped (getLastErrorCopy());
     }
 
+    // As above, for a stream that reported an error.
     void notifyStreamError()
     {
-        if (! lifecycleLock.tryEnter())
-            return;
-
-        struct Unlocker
         {
-            ~Unlocker() { lock.exit(); }
-            CriticalSection& lock;
-        } unlocker { lifecycleLock };
+            const ScopedLock sl (lifecycleLock);
 
-        if (! pendingErrorNotify.exchange (false))
-            return;
+            if (! pendingErrorNotify.exchange (false))
+                return;
+        }
 
-        notifyHostStopped (getLastErrorCopy());
+        const auto errorText = getLastErrorCopy();
+        notifyHostStopped (errorText.isEmpty() ? String ("The PipeWire stream failed") : errorText);
     }
 
-    // Rebuilds the server-side objects, optionally resuming playback.
-    void restartServerSide (uint32_t newSinkNodeId, uint32_t newSourceNodeId, bool resumeAfterwards)
+    // Rebuilds the server-side objects, optionally resuming playback. Returns
+    // false when the rebuild didn't complete, in which case the caller has to
+    // retry later.
+    //
+    // The waiting for the server deliberately happens without the lifecycle
+    // lock held: holding it across the wait would freeze the message thread for
+    // as long as it takes the server to start the streams.
+    bool restartServerSide (uint32_t newSinkNodeId, uint32_t newSourceNodeId, bool resumeAfterwards)
     {
-        if (! lifecycleLock.tryEnter())
-            return;
+        bool shouldResume = false;
 
-        struct Unlocker
         {
-            ~Unlocker() { lock.exit(); }
-            CriticalSection& lock;
-        } unlocker { lifecycleLock };
+            const ScopedLock sl (lifecycleLock);
 
-        if (shuttingDown.load() || ! isOpen_.load())
-            return;
+            if (shuttingDown.load() || ! isOpen_.load())
+                return true;
 
-        const bool shouldResume = resumeAfterwards ? (resumeAfterRecovery.load() || isPlaying_.load())
-                                                   : isPlaying_.load();
+            shouldResume = resumeAfterwards ? (resumeAfterRecovery.load() || isPlaying_.load())
+                                            : isPlaying_.load();
 
-        setLastError ({});
-        streamErrorNotified = false;
-        pendingErrorNotify = false;
-        serverLost = false;
+            setLastError ({});
+            streamErrorNotified = false;
+            pendingErrorNotify = false;
+            serverLost = false;
 
-        setActive (false);
-        teardownServerObjects();
+            setActive (false);
 
-        sinkNodeId = newSinkNodeId;
-        sourceNodeId = newSourceNodeId;
+            if (! teardownServerObjects())
+            {
+                // The loop thread hasn't stopped yet, so nothing can be
+                // destroyed. Leave everything alone and try again later.
+                needsRebuildAfterLoss = true;
+                return false;
+            }
 
-        streamErrorNotified = false;
-        pendingRestart = false;
+            sinkNodeId = newSinkNodeId;
+            sourceNodeId = newSourceNodeId;
 
-        if (! setupServerObjects() || ! createStreamObjects())
+            pendingRestart = false;
+
+            if (! setupServerObjects() || ! createStreamObjects())
+            {
+                setLastError ("Could not reopen the PipeWire streams");
+                teardownServerObjects();
+                isPlaying_ = false;
+
+                // Try again on the next monitor cycle.
+                needsRebuildAfterLoss = true;
+                return false;
+            }
+
+            // The rebuild may be running against a device with a different rate
+            // or quantum (following the session default is the common case), so
+            // the published values are restored to what we ask for rather than
+            // left at the previous device's numbers. The negotiated values
+            // replace them as soon as the new streams report them.
+            currentSampleRate = requestedSampleRate;
+            currentBufferSize = requestedBufferSize;
+        }
+
+        if (! waitForStreamsToStart())
         {
-            setLastError ("Could not reopen the PipeWire streams");
+            const ScopedLock sl (lifecycleLock);
+
             teardownServerObjects();
             isPlaying_ = false;
-
-            // Try again on the next monitor cycle.
             needsRebuildAfterLoss = true;
-            return;
+            return false;
         }
 
-        if (currentSampleRate.load() <= 0)
-            currentSampleRate = requestedSampleRate;
+        // Resume only when there is still a host callback to resume: a rebuild
+        // that follows a stream error or a lost server detaches the callback
+        // (notifyHostStopped()) and tells the host that the device has stopped,
+        // so claiming to be playing would report a running device that silently
+        // delivers nothing - and the host would miss the
+        // audioDeviceAboutToStart() that publishes the new sample rate and
+        // block size.
+        const bool haveCallback = callback.load (std::memory_order_acquire) != nullptr;
 
-        if (currentBufferSize.load() <= 0)
-            currentBufferSize = requestedBufferSize;
+        // The sample rate or block size may have changed since the host was last
+        // told about this device - both after a recovery and after following a
+        // new session default - so notify it before the streams are activated.
+        // This happens outside of the lifecycle lock, like in start(), because
+        // the host is allowed to call back into the device from here.
+        if (shouldResume && haveCallback)
+            if (auto* cb = callback.load (std::memory_order_acquire))
+                cb->audioDeviceAboutToStart (this);
 
-        resumeAfterRecovery = false;
-
-        if (shouldResume)
         {
-            if (resumeAfterwards)
-                if (auto* cb = callback.load())
-                    cb->audioDeviceAboutToStart (this);
+            const ScopedLock sl (lifecycleLock);
 
-            setActive (true);
-            isPlaying_ = true;
+            if (shuttingDown.load() || ! isOpen_.load())
+                return true;
+
+            // The rebuild worked, so start the retry backoff from scratch.
+            clearRebuildBackoff();
+
+            resumeAfterRecovery = false;
+
+            // The callback is re-checked under the lock because the host may
+            // have started us again while the streams were being rebuilt.
+            if (shouldResume && callback.load (std::memory_order_acquire) != nullptr)
+            {
+                setActive (true);
+                isPlaying_ = true;
+            }
+            else if (shouldResume)
+            {
+                // There is nothing to deliver audio to - the host has already
+                // been told that the device stopped - so don't report ourselves
+                // as playing.
+                isPlaying_ = false;
+            }
         }
+
+        return true;
     }
 
     //==============================================================================
@@ -1972,8 +2515,13 @@ private:
     String lastError;
     mutable CriticalSection errorLock;
 
-    // Serialises open/close and the monitor thread's restarts.
+    // Serialises open/close and the monitor thread's restarts. Only ever held
+    // for short state transitions - never while waiting for the loop thread or
+    // for the server, because the host may be blocked on it.
     CriticalSection lifecycleLock;
+
+    // Serialises callback swaps. Never taken while lifecycleLock is held.
+    CriticalSection callbackLock;
 
     std::atomic<AudioIODeviceCallback*> callback { nullptr };
     std::atomic<uint32_t> callbackGeneration { 0 };
@@ -1986,6 +2534,17 @@ private:
     std::atomic<bool> serverLost { false }, pendingRestart { false }, streamErrorNotified { false };
     std::atomic<bool> resumeAfterRecovery { false }, pendingLostNotify { false }, needsRebuildAfterLoss { false };
     std::atomic<bool> pendingErrorNotify { false };
+
+    // Which streams this open() created, and which of them have reached the
+    // paused state. These let the loop thread work out whether both streams are
+    // running without touching the stream pointers, which the control thread
+    // may be publishing at the same time.
+    std::atomic<bool> wantPlaybackStream { false }, wantCaptureStream { false };
+    std::atomic<bool> playbackStreamReady { false }, captureStreamReady { false };
+
+    // Exponential backoff for rebuild attempts after the server went away.
+    double nextRebuildAttemptTime = 0.0;
+    int rebuildBackoffMs = 1000;
 
     std::unique_ptr<StreamData> playbackStream, captureStream;
     std::unique_ptr<AudioThread> audioThread;
@@ -2004,8 +2563,10 @@ private:
 
     double requestedSampleRate = 48000.0;
     int requestedBufferSize = 512;
-    uint32_t sinkNodeId = SPA_ID_INVALID;
-    uint32_t sourceNodeId = SPA_ID_INVALID;
+    // Which nodes the streams are connected to. Written by the control thread
+    // and read by the monitor thread (which decides where to rebuild them) as
+    // well as by the latency/routing queries, so these are atomics.
+    std::atomic<uint32_t> sinkNodeId { SPA_ID_INVALID }, sourceNodeId { SPA_ID_INVALID };
     uint32_t streamIdCounter = 0;
 
     bool followsDefaultSink = false, followsDefaultSource = false;
@@ -2013,6 +2574,10 @@ private:
 
     BigInteger enabledInputChannels, enabledOutputChannels;
     WaitableEvent streamsStartedEvent;
+
+    static constexpr int streamStartTimeoutMs = 10000;
+    static constexpr int loopThreadStopTimeoutMs = 2000;
+    static constexpr int maxRebuildBackoffMs = 30000;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PipeWireAudioIODevice)
 };
@@ -2033,32 +2598,77 @@ public:
     {
         if (watcher != nullptr)
         {
-            watcher->stopThread (2000);
-            watcher.reset();
+            // Never force-kill the watcher: it may be in the middle of a
+            // PipeWire call, and the scan abandons itself once the thread has
+            // been asked to stop.
+            watcher->signalThreadShouldExit();
+
+            if (watcher->waitForThreadToExit (threadStopTimeoutMs))
+            {
+                watcher.reset();
+            }
+            else
+            {
+                // The thread is still inside a PipeWire call. Its destructor
+                // will block until it has left it (juce::Thread::stopThread (-1)
+                // in ~Thread()), so the wait above is only a best effort - it
+                // cannot make the destructor return any earlier.
+                JUCE_PIPEWIRE_LOG ("the PipeWire device list thread did not stop in time");
+            }
         }
     }
 
     //==============================================================================
+    // Scanning the graph is a round-trip to the server and can take several
+    // seconds, so its results are published into this snapshot and the
+    // enumeration methods only ever read the snapshot. Holding a lock across
+    // the scan would block the message thread - which is where the host calls
+    // getDeviceNames()/createDevice() - until the server answers.
     void scanForDevices() override
     {
-        const ScopedLock sl (scanLock);
-        scanForDevicesInternal();
+        DeviceListSnapshot newSnapshot;
+        PipeWireScanResult result;
+
+        if (! PipeWireRegistryScanner::scan (result))
+        {
+            // A failed scan - a server that is restarting, or one that didn't
+            // answer within the timeout - must not be reported as "there are no
+            // devices any more": replacing the list would make the host tear
+            // down the device it is currently using, so the previous snapshot is
+            // kept instead.
+            const ScopedLock sl (snapshotLock);
+            snapshot.valid = true;
+            return;
+        }
+
+        appendDevices (result.sinks,   result.defaultSinkKey,   newSnapshot.outputNames,
+                       newSnapshot.outputKeys, newSnapshot.outputChannels, newSnapshot.defaultOutputKey);
+        appendDevices (result.sources, result.defaultSourceKey, newSnapshot.inputNames,
+                       newSnapshot.inputKeys,  newSnapshot.inputChannels,  newSnapshot.defaultInputKey);
+
+        newSnapshot.outputNames.appendNumbersToDuplicates (false, true);
+        newSnapshot.inputNames.appendNumbersToDuplicates (false, true);
+
+        newSnapshot.valid = true;
+
+        const ScopedLock sl (snapshotLock);
+        snapshot = std::move (newSnapshot);
     }
 
     StringArray getDeviceNames (bool wantInputNames) const override
     {
-        const ScopedLock sl (scanLock);
-        jassert (hasScanned); // need to call scanForDevices() before doing this
-        return wantInputNames ? inputNames : outputNames;
+        const ScopedLock sl (snapshotLock);
+        jassert (snapshot.valid); // need to call scanForDevices() before doing this
+        return wantInputNames ? snapshot.inputNames : snapshot.outputNames;
     }
 
     int getDefaultDeviceIndex (bool forInput) const override
     {
-        const ScopedLock sl (scanLock);
-        jassert (hasScanned); // need to call scanForDevices() before doing this
+        const ScopedLock sl (snapshotLock);
+        jassert (snapshot.valid); // need to call scanForDevices() before doing this
 
-        const auto& keys = forInput ? inputKeys : outputKeys;
-        const auto& defaultKey = forInput ? defaultInputKey : defaultOutputKey;
+        const auto& keys = forInput ? snapshot.inputKeys : snapshot.outputKeys;
+        const auto& defaultKey = forInput ? snapshot.defaultInputKey : snapshot.defaultOutputKey;
 
         if (defaultKey.isNotEmpty())
         {
@@ -2075,12 +2685,12 @@ public:
 
     int getIndexOfDevice (AudioIODevice* device, bool asInput) const override
     {
-        const ScopedLock sl (scanLock);
-        jassert (hasScanned); // need to call scanForDevices() before doing this
+        const ScopedLock sl (snapshotLock);
+        jassert (snapshot.valid); // need to call scanForDevices() before doing this
 
         if (auto* d = dynamic_cast<PipeWireAudioIODevice*> (device))
-            return asInput ? inputKeys.indexOf (d->sourceKey)
-                           : outputKeys.indexOf (d->sinkKey);
+            return asInput ? snapshot.inputKeys.indexOf (d->sourceKey)
+                           : snapshot.outputKeys.indexOf (d->sinkKey);
 
         return -1;
     }
@@ -2088,11 +2698,11 @@ public:
     AudioIODevice* createDevice (const String& outputDeviceName,
                                  const String& inputDeviceName) override
     {
-        const ScopedLock sl (scanLock);
-        jassert (hasScanned); // need to call scanForDevices() before doing this
+        const ScopedLock sl (snapshotLock);
+        jassert (snapshot.valid); // need to call scanForDevices() before doing this
 
-        const auto inputIndex  = inputNames.indexOf (inputDeviceName);
-        const auto outputIndex = outputNames.indexOf (outputDeviceName);
+        const auto inputIndex  = snapshot.inputNames.indexOf (inputDeviceName);
+        const auto outputIndex = snapshot.outputNames.indexOf (outputDeviceName);
 
         if (inputIndex < 0 && outputIndex < 0)
             return nullptr;
@@ -2100,12 +2710,12 @@ public:
         const auto hasOutput = outputIndex >= 0;
 
         return new PipeWireAudioIODevice (getTypeName(),
-                                          hasOutput ? outputKeys.getReference (outputIndex) : String(),
+                                          hasOutput ? snapshot.outputKeys.getReference (outputIndex) : String(),
                                           hasOutput ? outputDeviceName : String(),
-                                          hasOutput ? outputChannels.getReference (outputIndex) : StringArray(),
-                                          inputIndex >= 0 ? inputKeys.getReference (inputIndex) : String(),
+                                          hasOutput ? snapshot.outputChannels.getReference (outputIndex) : StringArray(),
+                                          inputIndex >= 0 ? snapshot.inputKeys.getReference (inputIndex) : String(),
                                           inputIndex >= 0 ? inputDeviceName : String(),
-                                          inputIndex >= 0 ? inputChannels.getReference (inputIndex) : StringArray());
+                                          inputIndex >= 0 ? snapshot.inputChannels.getReference (inputIndex) : StringArray());
     }
 
 private:
@@ -2123,15 +2733,22 @@ private:
 
         void run() override
         {
+            int idleCycles = 0;
+
             while (! threadShouldExit())
             {
-                for (int i = 0; i < 10 && ! threadShouldExit(); ++i)
+                // Poll frequently while the graph is changing, and back off once
+                // it has been stable for a while: every poll opens a fresh
+                // connection to the server and walks the whole graph.
+                const auto cycleMs = idleCycles < 5 ? 1000 : 5000;
+
+                for (int i = 0; i < cycleMs / 100 && ! threadShouldExit(); ++i)
                     Thread::sleep (100);
 
                 if (threadShouldExit())
                     break;
 
-                owner.refreshDeviceListIfNeeded();
+                idleCycles = owner.refreshDeviceListIfNeeded() ? 0 : idleCycles + 1;
             }
         }
 
@@ -2141,43 +2758,18 @@ private:
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DeviceListWatcher)
     };
 
-    void scanForDevicesInternal()
+    // Returns true when the device list changed.
+    bool refreshDeviceListIfNeeded()
     {
-        outputNames.clear();
-        outputKeys.clear();
-        outputChannels.clear();
-        inputNames.clear();
-        inputKeys.clear();
-        inputChannels.clear();
-        defaultOutputKey.clear();
-        defaultInputKey.clear();
-
-        PipeWireScanResult result;
-
-        if (! PipeWireRegistryScanner::scan (result))
-        {
-            hasScanned = true;
-            return;
-        }
-
-        appendDevices (result.sinks,   result.defaultSinkKey,   outputNames, outputKeys, outputChannels, defaultOutputKey);
-        appendDevices (result.sources, result.defaultSourceKey, inputNames,  inputKeys,  inputChannels,  defaultInputKey);
-
-        outputNames.appendNumbersToDuplicates (false, true);
-        inputNames.appendNumbersToDuplicates (false, true);
-
-        hasScanned = true;
-    }
-
-    void refreshDeviceListIfNeeded()
-    {
+        // The scan runs outside of the snapshot lock, so a slow or misbehaving
+        // server can't block the enumeration methods.
+        scanForDevices();
         StringArray outputs, inputs;
 
         {
-            const ScopedLock sl (scanLock);
-            scanForDevicesInternal();
-            outputs = outputNames;
-            inputs = inputNames;
+            const ScopedLock sl (snapshotLock);
+            outputs = snapshot.outputNames;
+            inputs = snapshot.inputNames;
         }
 
         if (! hasComparedList)
@@ -2185,7 +2777,7 @@ private:
             hasComparedList = true;
             lastOutputNames = outputs;
             lastInputNames = inputs;
-            return;
+            return false;
         }
 
         if (outputs != lastOutputNames || inputs != lastInputNames)
@@ -2193,7 +2785,10 @@ private:
             lastOutputNames = outputs;
             lastInputNames = inputs;
             notifyListeners();
+            return true;
         }
+
+        return false;
     }
 
     void notifyListeners()
@@ -2234,11 +2829,17 @@ private:
         }
     }
 
-    mutable CriticalSection scanLock;
-    StringArray outputNames, outputKeys, inputNames, inputKeys;
-    Array<StringArray> outputChannels, inputChannels;
-    String defaultOutputKey, defaultInputKey;
-    bool hasScanned = false;
+    struct DeviceListSnapshot
+    {
+        StringArray outputNames, outputKeys, inputNames, inputKeys;
+        Array<StringArray> outputChannels, inputChannels;
+        String defaultOutputKey, defaultInputKey;
+        bool valid = false;
+    };
+
+    // Only ever read under snapshotLock; written by scanForDevices().
+    DeviceListSnapshot snapshot;
+    mutable CriticalSection snapshotLock;
 
     StringArray lastOutputNames, lastInputNames;
     bool hasComparedList = false;
@@ -2252,7 +2853,7 @@ private:
 // which is compiled into the same translation unit.
 static inline AudioIODeviceType* createAudioIODeviceType_PipeWire_Native()
 {
-    if (! loadPipeWireLibrary())
+    if (! initialisePipeWireLibrary())
         return nullptr;
 
     return new PipeWireAudioIODeviceType();
