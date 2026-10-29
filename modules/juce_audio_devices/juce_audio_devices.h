@@ -192,8 +192,8 @@
     If you have PipeWire installed and want to use it, set the JUCE_PIPEWIRE
     flag to 1.
 
-    Enabling this flag also makes PipeWire the default device type on Linux:
-    PipeWire is registered ahead of ALSA and JACK, so wherever
+    Enabling this flag also makes PipeWire the preferred default device type
+    on Linux: PipeWire is registered ahead of ALSA and JACK, so wherever
     AudioDeviceManager picks a type on its own it may now prefer PipeWire over
     either of them. A saved AudioDeviceManager XML state that does not pin a
     device type that still works on the current system may therefore switch

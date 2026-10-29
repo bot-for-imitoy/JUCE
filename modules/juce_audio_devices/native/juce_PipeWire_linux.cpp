@@ -819,9 +819,9 @@ private:
       of its own and walks the whole graph. None of them may be called from a
       realtime thread. start() and stop() no longer wait for the callback
       running on the calling thread (see waitForInFlightCallbacks()), but the
-      lock they take is reason enough by itself. The remaining getters aren't
-      realtime fodder either - several hand back a container by value - so the
-      six above are the whole of the audio-thread interface.
+      lock they take is reason enough by itself. The other stream-state getters
+      aren't realtime fodder either - several hand back a container by value -
+      so the six above are the realtime-safe stream queries.
 
     - The lock can be held for seconds, because the monitor thread keeps it
       across the teardown and the stream creation - it is only released while
