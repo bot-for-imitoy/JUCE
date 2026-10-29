@@ -24,7 +24,7 @@ or
 #### juce_audio_devices
 - libasound2-dev
 - libjack-jackd2-dev (unless `JUCE_JACK=0`)
-- libpipewire-0.3-dev (unless `JUCE_PIPEWIRE=0`)
+- libpipewire-0.3-dev (only needed when `JUCE_PIPEWIRE=1`)
 
 #### juce_audio_processors
 - ladspa-sdk (unless `JUCE_PLUGINHOST_LADSPA=0`)
