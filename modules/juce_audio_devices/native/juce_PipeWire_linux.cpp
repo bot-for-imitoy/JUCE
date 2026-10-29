@@ -52,25 +52,31 @@ namespace juce
 //==============================================================================
 static void* juce_libpipewireHandle = nullptr;
 
-static void* juce_loadPipeWireFunction (const char* const name)
-{
-    if (juce_libpipewireHandle == nullptr)
-        return nullptr;
-
-    return dlsym (juce_libpipewireHandle, name);
-}
-
+// The handle is published through a function-local static so that the dlopen()
+// happens exactly once: the device list scanner, the monitor thread and the
+// message thread can all reach this code at the same time, and a check-then-set
+// on a plain pointer would let two of them open the library and leak one handle.
 static bool loadPipeWireLibrary()
 {
-    if (juce_libpipewireHandle == nullptr)
+    static const bool loaded = []
     {
         juce_libpipewireHandle = dlopen ("libpipewire-0.3.so.0", RTLD_LAZY);
 
         if (juce_libpipewireHandle == nullptr)
             juce_libpipewireHandle = dlopen ("libpipewire-0.3.so", RTLD_LAZY);
-    }
 
-    return juce_libpipewireHandle != nullptr;
+        return juce_libpipewireHandle != nullptr;
+    }();
+
+    return loaded;
+}
+
+static void* juce_loadPipeWireFunction (const char* const name)
+{
+    if (! loadPipeWireLibrary())
+        return nullptr;
+
+    return dlsym (juce_libpipewireHandle, name);
 }
 
 #define JUCE_DECL_PIPEWIRE_FUNCTION(return_type, fn_name, argument_types, arguments)  \
@@ -95,6 +101,7 @@ static bool loadPipeWireLibrary()
 //==============================================================================
 // Core/context/loop
 JUCE_DECL_VOID_PIPEWIRE_FUNCTION (pw_init, (int* argc, char*** argv), (argc, argv))
+JUCE_DECL_PIPEWIRE_FUNCTION (const char*, pw_get_library_version, (), ())
 JUCE_DECL_PIPEWIRE_FUNCTION (struct pw_main_loop*, pw_main_loop_new, (const struct spa_dict* props), (props))
 JUCE_DECL_VOID_PIPEWIRE_FUNCTION (pw_main_loop_destroy, (struct pw_main_loop* loop), (loop))
 JUCE_DECL_PIPEWIRE_FUNCTION (struct pw_loop*, pw_main_loop_get_loop, (struct pw_main_loop* loop), (loop))
@@ -151,6 +158,44 @@ static inline struct pw_properties* createEmptyPipeWireProperties()
 }
 
 //==============================================================================
+// The dynamic loader will happily accept any libpipewire-0.3.so, but the
+// structs and event tables used here are laid out by the headers this file was
+// compiled against. A runtime library that is older than those headers can
+// therefore describe a different ABI, which is worth a warning rather than a
+// silent misbehaviour.
+static void checkRuntimeVersion()
+{
+    const auto* version = juce::pw_get_library_version();
+
+    if (version == nullptr)
+        return;
+
+    int major = 0, minor = 0, micro = 0;
+
+    if (sscanf (version, "%d.%d.%d", &major, &minor, &micro) < 2)
+        return;
+
+    const auto runtime = major * 1000000 + minor * 1000 + micro;
+    constexpr int oldestSupported = 0 * 1000000 + 3 * 1000 + 32;
+
+    if (runtime < oldestSupported)
+    {
+        JUCE_PIPEWIRE_LOG ("libpipewire " << version << " is older than the 0.3.32 this backend needs");
+    }
+
+   #if defined (PW_MAJOR_VERSION) && defined (PW_MINOR_VERSION) && defined (PW_MICRO_VERSION)
+    constexpr int headers = PW_MAJOR_VERSION * 1000000 + PW_MINOR_VERSION * 1000 + PW_MICRO_VERSION;
+
+    if (runtime < headers)
+    {
+        JUCE_PIPEWIRE_LOG ("libpipewire " << version << " is older than the headers this build used ("
+                                          << PW_MAJOR_VERSION << "." << PW_MINOR_VERSION << "."
+                                          << PW_MICRO_VERSION << ")");
+    }
+   #endif
+}
+
+//==============================================================================
 // pw_init() has to be called before any other PipeWire entry point, and it may
 // rewrite the arguments that it is given the first time around. pw_deinit()
 // used to tear down the process-wide PipeWire state without any reference
@@ -171,6 +216,7 @@ static bool initialisePipeWireLibrary()
         char* fakeArgv[] = { executableName, nullptr };
         char** fakeArgvPtr = fakeArgv;
         juce::pw_init (&fakeArgc, &fakeArgvPtr);
+        checkRuntimeVersion();
         return true;
     }();
 
@@ -341,7 +387,15 @@ public:
         }
         else if (String (type) == PW_TYPE_INTERFACE_Metadata)
         {
-            metadataIds.addIfNotAlreadyThere (id);
+            MetadataRecord record;
+            record.id = id;
+            record.name = String::fromUTF8 (getProp (props, PW_KEY_METADATA_NAME));
+
+            const auto known = std::any_of (metadataIds.begin(), metadataIds.end(),
+                                            [id] (const MetadataRecord& r) { return r.id == id; });
+
+            if (! known)
+                metadataIds.add (record);
         }
         else if (String (type) == PW_TYPE_INTERFACE_Link)
         {
@@ -411,6 +465,12 @@ public:
         uint32_t inputNode = SPA_ID_INVALID;
     };
 
+    struct MetadataRecord
+    {
+        uint32_t id = SPA_ID_INVALID;
+        String name;
+    };
+
 private:
     //==============================================================================
     PipeWireRegistryScanner()
@@ -469,10 +529,15 @@ private:
             return false;
 
         // The "default" metadata contains the names of the default sink and
-        // source. We bind to all metadata objects and read their properties to
-        // find those names.
-        for (auto metadataId : metadataIds)
-            bindMetadata (metadataId);
+        // source. Other metadata objects can carry the same keys, so the one
+        // called "default" is preferred when the graph has one - binding all of
+        // them would let whichever replied last decide what the default is.
+        const auto haveDefaultMetadata = std::any_of (metadataIds.begin(), metadataIds.end(),
+                                                      [] (const MetadataRecord& r) { return r.name == "default"; });
+
+        for (const auto& metadata : metadataIds)
+            if (! haveDefaultMetadata || metadata.name == "default")
+                bindMetadata (metadata.id);
 
         if (metadataBindings.size() > 0)
         {
@@ -723,7 +788,7 @@ private:
     Array<NodeRecord> nodes;
     Array<PortRecord> ports;
     Array<LinkRecord> links;
-    Array<uint32_t> metadataIds;
+    Array<MetadataRecord> metadataIds;
     Array<std::unique_ptr<MetadataBinding>> metadataBindings;
     struct spa_hook coreHook {}, registryHook {};
     bool coreHookAdded = false, registryHookAdded = false;
@@ -969,9 +1034,28 @@ public:
         if (nodeId == SPA_ID_INVALID)
             return {};
 
+        const auto now = Time::getMillisecondCounterHiRes();
+
+        {
+            const ScopedLock sl (routedNameLock);
+
+            if (cachedRoutedNameNodeId == nodeId && now < cachedRoutedNameExpiry)
+                return cachedRoutedName.isNotEmpty() ? std::optional<String> (cachedRoutedName)
+                                                     : std::optional<String>();
+        }
+
         // This performs a registry round-trip, which is why the method isn't
-        // allowed to be called from a realtime thread.
+        // allowed to be called from a realtime thread. The answer is cached for
+        // a moment: callers that show the routing in the UI tend to ask over and
+        // over, and every uncached call is a full scan of the graph.
         const auto peerName = PipeWireRegistryScanner::findRoutedPeerName (nodeId, true);
+
+        {
+            const ScopedLock sl (routedNameLock);
+            cachedRoutedName = peerName;
+            cachedRoutedNameNodeId = nodeId;
+            cachedRoutedNameExpiry = now + routedNameCacheMs;
+        }
 
         if (peerName.isEmpty())
             return {};
@@ -1048,6 +1132,14 @@ private:
     // does so would otherwise wait for the very callback this is waiting for.
     void waitForInFlightCallbacks() const
     {
+        // A host that calls in from inside its own IO callback is the only
+        // callback that can still be running: detachCallback() has already
+        // stopped any new one from starting, and the one that is running cannot
+        // return until the call that got us here returns. Waiting for it would
+        // deadlock, so the wait is skipped for that one case.
+        if (callbackOnCurrentThread == this)
+            return;
+
         while (activeCallbacks.load (std::memory_order_acquire) != 0)
             Thread::sleep (1);
     }
@@ -1137,7 +1229,12 @@ private:
             return;
         }
 
+        const auto* const previousCallbackDevice = callbackOnCurrentThread;
+        callbackOnCurrentThread = this;
+
         cb->audioDeviceIOCallbackWithContext (inputData, numInputs, outputData, numOutputs, numSamples, {});
+
+        callbackOnCurrentThread = previousCallbackDevice;
         activeCallbacks.fetch_sub (1, std::memory_order_release);
     }
 
@@ -1262,18 +1359,25 @@ private:
         for (int attempt = 0; attempt < 3 && ! tornDown; ++attempt)
             tornDown = teardownServerObjects();
 
-        if (! tornDown)
+        if (tornDown)
         {
+            outputPtrs.free();
+            inputPtrs.free();
+            outputPtrCapacity = 0;
+            inputPtrCapacity = 0;
+            captureBuffer.setSize (0, 0);
+            captureSamples = 0;
+        }
+        else
+        {
+            // The streams are still alive, and their process callbacks run on
+            // PipeWire's own data loop thread, which doesn't look at
+            // shuttingDown. Freeing the buffers those callbacks are writing to
+            // would be a use-after-free, so they are left alone for the next
+            // close() attempt (or the destructor).
             JUCE_PIPEWIRE_LOG ("the PipeWire loop thread did not stop; "
                                "deferring the server object teardown");
         }
-
-        outputPtrs.free();
-        inputPtrs.free();
-        outputPtrCapacity = 0;
-        inputPtrCapacity = 0;
-        captureBuffer.setSize (0, 0);
-        captureSamples = 0;
 
         sinkNodeId = SPA_ID_INVALID;
         sourceNodeId = SPA_ID_INVALID;
@@ -1393,23 +1497,24 @@ private:
     // later.
     bool teardownServerObjects()
     {
-        // The streams have to be destroyed while the loop is still being
-        // pumped, and never concurrently with the dispatch of their own
-        // callbacks:
+        // The streams have to be destroyed while the core loop is still being
+        // pumped:
         //
-        // - PipeWire marshals proxy messages through the loop and blocks until
-        //   the loop thread has processed them. Destroying a stream from here
+        // - PipeWire marshals proxy messages through the core loop and blocks
+        //   until that loop has processed them. Destroying a stream from here
         //   after the loop thread has been stopped therefore never returns
         //   (measured: pw_stream_destroy() with a stopped loop hangs forever,
         //   with a running loop it returns in microseconds).
-        // - pw_stream_destroy() frees the stream object on the calling thread,
-        //   so destroying it while the loop thread is inside that stream's
-        //   process callback frees the pw_stream (and then the StreamData that
-        //   is handed to the callback) from under it.
+        // - The stream's process callbacks don't run on that loop: pw_stream
+        //   runs them on the context's data loop, on a thread of its own
+        //   (impl->data_loop = stream->node->data_loop). What keeps them from
+        //   touching a destroyed stream is pw_stream_destroy() itself, which
+        //   flushes that data loop with a blocking pw_loop_locked() before it
+        //   frees anything.
         //
-        // Running the destroy on the loop itself satisfies both: it is
-        // serialised with the dispatch of the callbacks, and the loop keeps
-        // running while this thread waits for it.
+        // Running the destroy on the core loop therefore keeps the loop pumped
+        // while this thread waits for the flush to complete, which is what the
+        // first point requires.
         if (playbackStream != nullptr || captureStream != nullptr)
         {
             if (audioThread != nullptr && pwLoop != nullptr && audioThread->isThreadRunning())
@@ -1578,7 +1683,7 @@ private:
         // channels that can be offered below (a format pod is roughly 60 bytes
         // plus 4 bytes per channel position); a pod that doesn't fit makes the
         // builder return nullptr, which is handled by stopping early.
-        uint8_t podBuffer[8192];
+        uint8_t podBuffer[16384];
         auto builder = SPA_POD_BUILDER_INIT (podBuffer, sizeof podBuffer);
 
         struct spa_audio_info_raw info {};
@@ -1594,32 +1699,28 @@ private:
             if (enabledChannels[channel])
                 info.position[position++] = getChannelPosition (channelNames[channel]);
 
-        // Offer a wider set of sample rates - the requested one first - so that
-        // a device that can't run at the requested rate is negotiated down
-        // instead of failing to open. This list is what
-        // getAvailableSampleRates() advertises; anything missing here would be
-        // silently replaced by one of the offered rates. The negotiated rate is
+        // Offer every rate that getAvailableSampleRates() advertises - the
+        // requested one first - so that a device that can't run at the requested
+        // rate is negotiated down instead of failing to open. Both lists come
+        // from the same helper: a rate that is advertised but not offered here
+        // would be silently replaced by one of these. The negotiated rate is
         // reported back through param_changed.
-        const double offeredRates[] = { requestedSampleRate,
-                                        8000.0, 11025.0, 12000.0, 16000.0, 22050.0, 24000.0, 32000.0,
-                                        44100.0, 48000.0, 64000.0, 88200.0, 96000.0, 176400.0, 192000.0 };
-        constexpr uint32_t maxNumFormats = (uint32_t) numElementsInArray (offeredRates);
+        const auto& offeredRates = SampleRateHelpers::getCommonSampleRates();
+        constexpr uint32_t maxNumFormats = 32;
 
         const struct spa_pod* params[maxNumFormats];
         uint32_t numParams = 0;
 
-        for (auto rate : offeredRates)
+        for (size_t i = 0; i <= offeredRates.size() && numParams < maxNumFormats; ++i)
         {
-            if (numParams == maxNumFormats)
-                break;
+            const auto rateToUse = (uint32_t) jmax (1.0, i == 0 ? requestedSampleRate : offeredRates[i - 1]);
 
-            const auto rateToUse = (uint32_t) jmax (1.0, rate);
-
-            // Skip duplicates of rates that were already added.
+            // Skip duplicates: the requested rate is usually one of the common
+            // ones, so it appears twice.
             bool duplicate = false;
 
-            for (uint32_t i = 0; i < numParams; ++i)
-                if (offeredRateMatches (params[i], rateToUse))
+            for (uint32_t j = 0; j < numParams; ++j)
+                if (offeredRateMatches (params[j], rateToUse))
                     duplicate = true;
 
             if (duplicate)
@@ -1714,9 +1815,10 @@ private:
     }
 
     //==============================================================================
-    // Only ever called from the loop thread (via destroyStreamsOnLoopThread), so
-    // no callback for the streams being destroyed can be running at the same
-    // time - see teardownServerObjects().
+    // Only ever called from the core loop thread (via destroyStreamsOnLoopThread),
+    // one stream at a time. Serialising this with the process callbacks is
+    // pw_stream_destroy()'s job - it flushes the data loop those callbacks run
+    // on - see teardownServerObjects().
     void destroyStreamObjects()
     {
         if (playbackStream != nullptr)
@@ -2017,7 +2119,9 @@ private:
                 // shouldn't normally happen. Discard the captured data and hand
                 // the host silence - the buffer may still hold the previous
                 // block, and passing that on would repeat a chunk of audio.
-                captureBuffer.clear (0, numSamples);
+                // AudioBuffer::clear() doesn't clamp its range, so it is
+                // clamped here.
+                captureBuffer.clear (0, jmin (numSamples, captureBuffer.getNumSamples()));
                 captureSamples = 0;
                 xruns++;
             }
@@ -2526,11 +2630,25 @@ private:
     std::atomic<AudioIODeviceCallback*> callback { nullptr };
     std::atomic<uint32_t> callbackGeneration { 0 };
     std::atomic<int> activeCallbacks { 0 };
+
+    // Set on the thread that is currently running the host's IO callback for
+    // this device, so that a host which calls back into us from there does not
+    // wait for itself - see waitForInFlightCallbacks().
+    inline static thread_local const PipeWireAudioIODevice* callbackOnCurrentThread = nullptr;
     std::atomic<bool> isOpen_ { false }, isPlaying_ { false }, shuttingDown { false };
     std::atomic<double> currentSampleRate { 0.0 };
     std::atomic<int> currentBufferSize { 0 };
     std::atomic<int> xruns { 0 };
     std::atomic<uint32_t> playbackNodeId { SPA_ID_INVALID }, captureNodeId { SPA_ID_INVALID };
+
+    // The last answer from getRoutedOutputDeviceName(), which stays valid for a
+    // short while: the query itself is a registry round-trip, and the routing of
+    // a stream doesn't change on its own more often than this.
+    mutable CriticalSection routedNameLock;
+    mutable String cachedRoutedName;
+    mutable uint32_t cachedRoutedNameNodeId = SPA_ID_INVALID;
+    mutable double cachedRoutedNameExpiry = 0.0;
+    static constexpr double routedNameCacheMs = 1000.0;
     std::atomic<bool> serverLost { false }, pendingRestart { false }, streamErrorNotified { false };
     std::atomic<bool> resumeAfterRecovery { false }, pendingLostNotify { false }, needsRebuildAfterLoss { false };
     std::atomic<bool> pendingErrorNotify { false };
@@ -2557,6 +2675,12 @@ private:
 
     HeapBlock<float*> outputPtrs, inputPtrs;
     int outputPtrCapacity = 0, inputPtrCapacity = 0;
+
+    // Written by the capture stream's process callback and read by the playback
+    // one. Those run on the same thread for as long as the context has a single
+    // data loop, which is the default (context.num-data-loops == 1). With more
+    // than one data loop the two streams can be dispatched on different threads,
+    // and this would have to become a lock-free hand-over instead.
     AudioBuffer<float> captureBuffer;
     int captureSamples = 0;
     int maxBlockFrames = 8192;

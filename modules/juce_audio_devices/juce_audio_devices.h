@@ -177,15 +177,16 @@
 #endif
 
 /** Config: JUCE_PIPEWIRE
-    Enables native PipeWire audio devices (Linux only).
+    Enables native PipeWire audio devices (Linux only). This is disabled by
+    default.
 
     This uses libpipewire-0.3, which is loaded dynamically at runtime, so no
     extra library needs to be linked against your app. You will still need to
     have the PipeWire development headers installed in order to compile with
     this flag enabled. The package you need to install is "libpipewire-0.3-dev".
 
-    If you don't have PipeWire installed, or don't want to use it, just set the
-    JUCE_PIPEWIRE flag to 0.
+    If you have PipeWire installed and want to use it, set the JUCE_PIPEWIRE
+    flag to 1.
 */
 #ifndef JUCE_PIPEWIRE
  #define JUCE_PIPEWIRE 0
