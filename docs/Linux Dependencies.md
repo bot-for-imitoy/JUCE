@@ -64,7 +64,7 @@ available during runtime.
 - mesa-common-dev
 - libegl-dev
 
-The full command is as follows:
+The command for the required dependencies is as follows:
 
     sudo apt update
     sudo apt install libasound2-dev libjack-jackd2-dev \
@@ -74,6 +74,8 @@ The full command is as follows:
         libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libxi-dev \
         libwebkit2gtk-4.1-dev \
         libglu1-mesa-dev mesa-common-dev libegl-dev
+
+The optional backends are covered below, starting with [PipeWire](#optional-pipewire).
 
 ## Optional: PipeWire
 

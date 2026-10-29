@@ -808,10 +808,10 @@ private:
     Threading contract:
 
     - isOpen(), isPlaying(), getCurrentSampleRate(),
-      getCurrentBufferSizeSamples(), getXRunCount() and getCurrentBitDepth() read
-      nothing but atomics - getCurrentBitDepth() reads nothing at all - so they
-      are safe to call from a realtime thread, provided that the platform
-      implements these atomics lock-free.
+      getCurrentBufferSizeSamples() and getXRunCount() read nothing but atomics,
+      so they are safe to call from a realtime thread, provided that the platform
+      implements these atomics lock-free. getCurrentBitDepth() returns a
+      constant, so it is safe to call from anywhere.
 
     - start(), stop(), getOutputLatencyInSamples() and getInputLatencyInSamples()
       take the lifecycle lock. getRoutedOutputDeviceName() doesn't take that

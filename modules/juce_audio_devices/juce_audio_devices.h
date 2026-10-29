@@ -193,13 +193,12 @@
     flag to 1.
 
     Enabling this flag also makes PipeWire the default device type on Linux:
-    PipeWire is registered before ALSA and JACK, and when a saved XML state does
-    not name a usable type, AudioDeviceManager picks the earliest registered type
-    that matches one of the stored device names, or the earliest one that reports
-    any devices if none of the names match. A saved AudioDeviceManager XML state
-    that stores no "deviceType" attribute and no device names that only a later
-    type (ALSA or JACK) reports will therefore switch to PipeWire. States that
-    store a "deviceType" that is available in the current build are unaffected.
+    PipeWire is registered ahead of ALSA and JACK, so wherever
+    AudioDeviceManager picks a type on its own it may now prefer PipeWire over
+    either of them. A saved AudioDeviceManager XML state that does not pin a
+    device type that still works on the current system may therefore switch
+    from ALSA to PipeWire. A state that pins a device type that still works on
+    the current system keeps using it.
 */
 #ifndef JUCE_PIPEWIRE
  #define JUCE_PIPEWIRE 0
