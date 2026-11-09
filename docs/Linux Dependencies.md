@@ -100,3 +100,14 @@ instead of plain `-I`, which the compiler treats as system headers. That avoids 
 number of pedantic warnings from these third-party headers. Nothing is linked
 from pkg-config here: libpipewire is loaded with `dlopen()` at runtime, so adding
 its `-l` flag would turn it into a hard startup dependency for no benefit.
+
+The backend creates its own PipeWire loop and pumps it on a JUCE thread, which
+also runs the stream's process callbacks: they are therefore not scheduled with
+realtime priority, unlike the ALSA and JACK backends. The device list is scanned
+on request and polled in the background once something has asked for it.
+
+Opening, closing and activating the streams round-trip through that loop thread,
+and each of those waits is bounded: a server that stops answering turns into
+`getLastError()` and an `audioDeviceError()` callback rather than a hang. A loop
+thread that cannot be stopped at all is abandoned instead of joined, which leaks
+that connection but keeps the host able to shut down.

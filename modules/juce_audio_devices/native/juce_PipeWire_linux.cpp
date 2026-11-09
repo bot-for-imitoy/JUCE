@@ -803,47 +803,209 @@ private:
 };
 
 //==============================================================================
+// Work that has to happen on the thread that pumps the connection's loop.
+//
+// libpipewire marshals a client->server message straight into the connection's
+// buffer from whichever thread makes the call, and there is exactly one such
+// buffer per connection: two threads creating, connecting or destroying a
+// stream at the same time corrupt it, which the library catches with
+// assert_single_pod() in module-protocol-native (aborting the host process) or,
+// depending on the timing, silently loses the message. Since 1.6 the stream
+// functions additionally refuse to run - "called from wrong context" - when
+// they arrive from a thread other than the one that owns the loop.
+//
+// The loop is pumped by AudioThread, so this queue is how the control thread
+// and the monitor thread hand that work over: the loop thread runs the queued
+// task between iterations, which also serialises it with the process callbacks
+// the loop dispatches.
+struct LoopTaskQueue final
+{
+    struct Task
+    {
+        std::function<void()> run;
+        WaitableEvent finished;
+        bool abandoned = false;
+    };
+
+    // Returns true if the task ran to completion. A false result means that it
+    // was never started, or that it did not finish within the timeout and may
+    // still be running - the caller then has to leave everything the task
+    // touches allocated.
+    bool post (std::function<void()> taskToRun, int timeoutMs)
+    {
+        auto task = std::make_shared<Task>();
+        task->run = std::move (taskToRun);
+
+        {
+            const ScopedLock sl (lock);
+
+            if (dead || threadExiting)
+                return false;
+
+            tasks.push_back (task);
+        }
+
+        if (! task->finished.wait (timeoutMs))
+        {
+            const ScopedLock sl (lock);
+            task->abandoned = true;
+
+            // Still queued, so it will never run and can be dropped. If it
+            // isn't in the list it is running right now and cannot be stopped.
+            tasks.erase (std::remove (tasks.begin(), tasks.end(), task), tasks.end());
+            return false;
+        }
+
+        const ScopedLock sl (lock);
+        return ! task->abandoned;
+    }
+
+    // Called on the loop thread, between iterations of the loop.
+    void runPending()
+    {
+        for (;;)
+        {
+            std::shared_ptr<Task> task;
+
+            {
+                const ScopedLock sl (lock);
+
+                if (threadExiting || tasks.empty())
+                    return;
+
+                task = tasks.front();
+                tasks.erase (tasks.begin());
+            }
+
+            // A throwing task must not escape into Thread::run() - and its
+            // caller would wait out the whole timeout for a signal that never
+            // comes - so the queue is kept exception-free.
+            try
+            {
+                task->run();
+            }
+            catch (...)
+            {
+            }
+
+            const ScopedLock sl (lock);
+            task->finished.signal();
+        }
+    }
+
+    // Called once the loop thread has been asked to exit: nothing queued after
+    // this point runs, and the callers of the queued tasks are released.
+    void stop()
+    {
+        const ScopedLock sl (lock);
+        threadExiting = true;
+
+        for (auto& task : tasks)
+        {
+            task->abandoned = true;
+            task->finished.signal();
+        }
+
+        tasks.clear();
+    }
+
+    // Called when the loop thread could not be stopped and its objects are
+    // being leaked: the queue may outlive the device, so it must not take any
+    // more work.
+    void markDead()
+    {
+        stop();
+
+        const ScopedLock sl (lock);
+        dead = true;
+    }
+
+    // True while the calling thread is the one that pumps this queue's loop.
+    // The queue is identified rather than the thread, so that the check keeps
+    // working while the device that owns it is being torn down.
+    static bool isCurrentThread (const LoopTaskQueue* queue)
+    {
+        return currentQueue == queue;
+    }
+
+    void enterLoopThread()    { currentQueue = this; }
+    void leaveLoopThread()    { currentQueue = nullptr; }
+
+    // Prepares the queue for a new connection. A queue that was marked dead
+    // (its loop thread was abandoned) stays dead.
+    void rearm()
+    {
+        const ScopedLock sl (lock);
+
+        if (! dead)
+            threadExiting = false;
+    }
+
+    CriticalSection lock;
+    std::vector<std::shared_ptr<Task>> tasks;
+    inline static thread_local const LoopTaskQueue* currentQueue = nullptr;
+    bool threadExiting = false, dead = false;
+};
+
+//==============================================================================
 /** A PipeWire sink/source pair.
 
     Threading contract:
 
     - isOpen(), isPlaying(), getCurrentSampleRate(),
-      getCurrentBufferSizeSamples() and getXRunCount() read nothing but atomics,
-      so they are safe to call from a realtime thread, provided that the platform
+      getCurrentBufferSizeSamples(), getOutputLatencyInSamples(),
+      getInputLatencyInSamples() and getXRunCount() read nothing but atomics, so
+      they are safe to call from a realtime thread, provided that the platform
       implements these atomics lock-free. getCurrentBitDepth() returns a
-      constant, so it is safe to call from anywhere.
+      constant, so it is safe to call from anywhere. The latency queries used to
+      take the lifecycle lock and read pw_stream_get_time() directly; the values
+      are now sampled by the process callbacks (see publishLatency()), which is
+      what makes them usable from a host's IO callback.
 
-    - start(), stop(), getOutputLatencyInSamples() and getInputLatencyInSamples()
-      take the lifecycle lock. getRoutedOutputDeviceName() doesn't take that
-      lock - it only guards its own short-lived cache - but it opens a connection
-      of its own and walks the whole graph. None of them may be called from a
-      realtime thread. start() and stop() no longer wait for the callback
-      running on the calling thread (see waitForInFlightCallbacks()), but the
-      lock they take is reason enough by itself. The other stream-state getters
-      aren't realtime fodder either - several hand back a container by value -
-      so the six above are the realtime-safe stream queries.
+    - Everything else - start(), stop(), open(), close(), the device list
+      queries that hand back a container by value, getRoutedOutputDeviceName()
+      and the monitor/rebuild path - may block on the lifecycle lock or on the
+      server, and must not be called from a realtime thread.
 
-    - The lock can be held for seconds, because the monitor thread keeps it
-      across the teardown and the stream creation - it is only released while
-      waiting for the streams to start - and a rebuild is what makes an
-      audio-thread caller circular:
+    - There are exactly two threads that touch the PipeWire connection:
 
-          data loop   : process callback -> host asks for the latency -> lock
-          monitor     : holds the lock -> teardown -> loop thread
-          loop thread : pw_stream_destroy() -> data loop leaves the callback
+          loop thread ("PipeWire Audio") : pumps the loop, dispatches the
+                                           process/state/param events, and runs
+                                           every task posted to the LoopTaskQueue
+          control thread                 : posts those tasks (stream create,
+                                           connect, activate, destroy, and the
+                                           connection teardown) and waits for
+                                           them, with a timeout
+
+      The process callbacks run on the loop thread, not on a data loop of their
+      own: the context is created on this loop and PW_STREAM_FLAG_RT_PROCESS is
+      not set, so PipeWire dispatches the node from the main loop - and therefore
+      from a thread that JUCE owns, with SCHED_OTHER scheduling and no realtime
+      priority. That is a limitation of this backend, not a property of
+      PipeWire; making the callbacks realtime means giving the context a data
+      loop and sampling the latency from the callback, and is not attempted here.
+
+    - The lifecycle lock is held across the teardown and across the stream
+      creation, and both of those wait for the loop thread, so a rebuild can hold
+      it for seconds. Nothing reachable from a realtime thread may therefore take
+      it - see the first point. The lock is not held while waiting for the
+      streams to start, nor while the host is notified.
 
     - open() and close() must never be called from an audio thread at all.
-      Tearing the streams down blocks until PipeWire's data loop has finished the
-      process callback it is running (pw_stream_destroy() takes that loop's mutex
-      through pw_loop_locked() or a blocking pw_loop_invoke(), depending on the
-      PipeWire version), so calling them from inside the callback asks the data
-      loop to wait for itself. AudioIODevice's own contract already
-      requires stop() to flush pending callbacks before returning, which no
-      implementation can do from within one of them, so this is not a
-      restriction that is specific to this backend.
+      Tearing the streams down asks PipeWire to flush the callback it is running
+      (pw_stream_destroy() takes the node's loop mutex through pw_loop_locked()),
+      so calling them from inside the callback asks the loop thread to wait for
+      itself. AudioIODevice's own contract already requires stop() to flush
+      pending callbacks before returning, which no implementation can do from
+      within one of them, so this is not specific to this backend.
 
-    The host is never notified from the PipeWire data loop either, and never with
-    the lifecycle lock held: audioDeviceError() is sent from the monitor thread,
+    A loop thread that stops responding is abandoned rather than joined: the
+    context, the streams and that thread are leaked on purpose, so that a stuck
+    audio device cannot turn into a deadlock in the host's shutdown path. See
+    abandonLoopThread().
+
+    The host is never notified from the loop thread, and never with the
+    lifecycle lock held: audioDeviceError() is sent from the monitor thread,
     audioDeviceAboutToStart() from the monitor thread during a rebuild and from
     whoever called start(), and audioDeviceStopped() from whoever detaches the
     callback - start(), stop(), open() or close().
@@ -871,6 +1033,13 @@ public:
     ~PipeWireAudioIODevice() override
     {
         close();
+
+        // A loop thread that had to be abandoned may still be running a process
+        // callback with pointers into these buffers, so they are leaked rather
+        // than handed back to the allocator underneath it. This only happens for
+        // a device that already failed to shut down (see abandonLoopThread()).
+        if (buffersLeaked)
+            buffers.release();
     }
 
     //==============================================================================
@@ -1011,8 +1180,7 @@ public:
 
         if (newCallback == callback.load (std::memory_order_acquire))
         {
-            const ScopedLock sl (lifecycleLock);
-            setActive (callback.load() != nullptr);
+            requestActive (callback.load() != nullptr);
             return;
         }
 
@@ -1023,12 +1191,10 @@ public:
         // so it has to happen outside of the lifecycle lock - see setCallback().
         setCallback (newCallback);
 
-        const ScopedLock sl (lifecycleLock);
-
         if (callback.load() != nullptr)
             xruns = 0;
 
-        setActive (callback.load() != nullptr);
+        requestActive (callback.load (std::memory_order_acquire) != nullptr);
     }
 
     void stop() override
@@ -1046,13 +1212,14 @@ public:
 
     int getOutputLatencyInSamples() override
     {
-        const ScopedLock sl (lifecycleLock);
-
-        auto latency = playbackStream != nullptr ? getLatencyInSamples (playbackStream->stream, currentSampleRate.load()) : 0;
+        // Nothing but atomics is read here: the value is sampled by the process
+        // callback, so a host may call this from its IO callback - which is what
+        // AudioIODevice's "returns quickly" contract implies.
+        auto latency = outputLatencySamples.load (std::memory_order_relaxed);
 
         // Input data is handed to the callback one block after capture, so add
         // an extra block of latency when doing full-duplex I/O.
-        if (playbackStream != nullptr && captureStream != nullptr)
+        if (wantPlaybackStream.load() && wantCaptureStream.load())
             latency += jmax (1, getCurrentBufferSizeSamples());
 
         return latency;
@@ -1060,11 +1227,9 @@ public:
 
     int getInputLatencyInSamples() override
     {
-        const ScopedLock sl (lifecycleLock);
+        auto latency = inputLatencySamples.load (std::memory_order_relaxed);
 
-        auto latency = captureStream != nullptr ? getLatencyInSamples (captureStream->stream, currentSampleRate.load()) : 0;
-
-        if (playbackStream != nullptr && captureStream != nullptr)
+        if (wantPlaybackStream.load() && wantCaptureStream.load())
             latency += jmax (1, getCurrentBufferSizeSamples());
 
         return latency;
@@ -1121,6 +1286,23 @@ private:
         struct spa_hook listener {};
         bool isCapture = false;
         int numChannels = 0;
+
+        // Set from the control thread when the device is being torn down and the
+        // stream objects have been handed over to a loop thread that could not
+        // be stopped. The event callbacks still receive this object in that
+        // case, so they check the flag instead of the owner pointer before they
+        // touch the device.
+        std::atomic<bool> detached { false };
+    };
+
+    // The stream pointers and a generation counter, shared with the tasks the
+    // control thread posts to the loop thread. A task holds its own reference,
+    // so it can be executed after the device that posted it is gone, and the
+    // generation tells it whether its snapshot is still the current connection.
+    struct ServerHandle
+    {
+        std::atomic<struct pw_stream*> playback { nullptr }, capture { nullptr };
+        std::atomic<uint64_t> generation { 0 };
     };
 
     //==============================================================================
@@ -1202,7 +1384,12 @@ private:
     {
         callback.store (newCallback, std::memory_order_release);
         callbackGeneration.fetch_add (1, std::memory_order_acq_rel);
-        isPlaying_ = (newCallback != nullptr);
+
+        // Attaching a callback doesn't make the device play: the streams are
+        // only started - and isPlaying() only becomes true - once the server
+        // has confirmed that they are streaming, see requestActive().
+        if (newCallback == nullptr)
+            isPlaying_ = false;
     }
 
     // Swaps the callback and makes sure that the previous callback isn't being
@@ -1338,7 +1525,7 @@ private:
         // If the previous teardown couldn't stop the worker threads, the server
         // objects are still alive: opening again would create a second set of
         // streams on top of them.
-        if (audioThread != nullptr || monitorThread != nullptr)
+        if (audioThread != nullptr || monitorThread != nullptr || loopAbandoned.load())
         {
             setLastError ("The PipeWire device is still shutting down");
             return getLastErrorCopy();
@@ -1401,32 +1588,35 @@ private:
         shuttingDown = true;
 
         stopMonitorThread();
+
+        // Stopping the streams first means the process callbacks have nothing to
+        // deliver while the streams are destroyed.
         setActive (false);
 
         // The caller has already detached the host callback, so no IO callback
         // can start while the server objects are being destroyed. The loop
-        // thread still has to be given a chance to leave pw_loop_iterate().
-        bool tornDown = false;
-
-        for (int attempt = 0; attempt < 3 && ! tornDown; ++attempt)
-            tornDown = teardownServerObjects();
+        // thread is given a bounded amount of time to finish what it is doing
+        // and is abandoned - not waited for forever - if it doesn't.
+        //
+        // An abandoned connection keeps its buffers for good: the leaked loop
+        // thread may still be running a process callback that reads them, and
+        // that is not worth trading for a few kilobytes.
+        const auto tornDown = teardownServerObjects() && ! loopAbandoned.load();
 
         if (tornDown)
         {
-            outputPtrs.free();
-            inputPtrs.free();
-            outputPtrCapacity = 0;
-            inputPtrCapacity = 0;
-            captureBuffer.setSize (0, 0);
-            captureSamples = 0;
+            buffers->outputChannelPointers.free();
+            buffers->inputChannelPointers.free();
+            buffers->outputCapacity = 0;
+            buffers->inputCapacity = 0;
+            buffers->capture.setSize (0, 0);
+            buffers->captureSamples = 0;
         }
         else
         {
-            // The streams are still alive, and their process callbacks run on
-            // PipeWire's own data loop thread, which doesn't look at
-            // shuttingDown. Freeing the buffers those callbacks are writing to
-            // would be a use-after-free, so they are left alone for the next
-            // close() attempt (or the destructor).
+            // The streams are still alive. Freeing the buffers their process
+            // callbacks are writing to would be a use-after-free, so they are
+            // left alone for the next close() attempt (or the destructor).
             JUCE_PIPEWIRE_LOG ("the PipeWire loop thread did not stop; "
                                "deferring the server object teardown");
         }
@@ -1458,7 +1648,7 @@ private:
         // really gone: while they are still running, the process callbacks must
         // stay inert so that they don't touch the buffers freed above, and the
         // monitor thread must not restart the server objects behind our back.
-        shuttingDown = (audioThread != nullptr || monitorThread != nullptr);
+        shuttingDown = (audioThread != nullptr || monitorThread != nullptr || loopAbandoned.load());
     }
 
     //==============================================================================
@@ -1529,57 +1719,141 @@ private:
 
         juce::pw_core_add_listener (pwCore, &coreListener, &getDeviceCoreEvents(), this);
 
-        // The loop thread dispatches PipeWire's messages, including the
-        // replies that pw_stream_connect() waits for.
-        audioThread = std::make_unique<AudioThread> (*this);
+        // The loop thread dispatches PipeWire's messages and runs the work the
+        // control thread posts to it - see LoopTaskQueue. It holds nothing but
+        // the loop pointer and the queue, so it stays self-contained even if the
+        // device has to be abandoned (see abandonLoopThread()).
+        taskQueue->rearm();
+        audioThread = std::make_unique<AudioThread> (pwLoop, taskQueue);
         audioThread->startThread (Thread::Priority::high);
         return true;
     }
 
-    // Runs on the loop thread - see teardownServerObjects().
-    static int destroyStreamsOnLoopThread (struct spa_loop*, bool, uint32_t,
-                                           const void*, size_t, void* userData)
+    // Runs a task on the thread that pumps the loop, waiting for it to finish.
+    // Called from the loop thread itself the task runs inline: waiting for the
+    // thread that is running this code would deadlock.
+    bool runOnLoopThread (std::function<void()> task, int timeoutMs)
     {
-        static_cast<PipeWireAudioIODevice*> (userData)->destroyStreamObjects();
-        return 0;
+        if (LoopTaskQueue::isCurrentThread (taskQueue.get()))
+        {
+            task();
+            return true;
+        }
+
+        return taskQueue->post (std::move (task), timeoutMs);
     }
 
-    // Returns false if the loop thread is still running, in which case nothing
-    // that depends on the loop may be destroyed and the caller has to try again
+    // Marks the streams as detached and gives up on the loop thread without
+    // stopping it.
+    //
+    // This is the last resort for a thread that is stuck inside libpipewire:
+    // everything it may still touch is leaked instead of freed, so the host
+    // gets a stuck audio device rather than a crash in its destructor path.
+    void abandonLoopThread()
+    {
+        detachStreams();
+
+        // The listener's user data is this object, which may be destroyed while
+        // the leaked loop thread keeps running: detach it first.
+        if (pwCore != nullptr)
+        {
+            spa_hook_remove (&coreListener);
+            pwCore = nullptr;
+        }
+
+        // Any task that is still queued or running now sees a different
+        // generation and does nothing with its snapshot of the stream pointers.
+        auto handle = serverHandle;
+        handle->playback = nullptr;
+        handle->capture = nullptr;
+        ++handle->generation;
+
+        loopAbandoned = true;
+        buffersLeaked = true;
+
+        if (taskQueue != nullptr)
+            taskQueue->markDead();
+
+        // The thread keeps its own loop pointer and queue, so it can be dropped
+        // without stopping it - joining it is exactly what would hang.
+        audioThread.release();
+
+        // The stream objects are still referenced by the loop thread's pending
+        // callbacks, which now find them detached. They, and the connection
+        // they belong to, are deliberately never freed.
+        playbackStream.release();
+        captureStream.release();
+
+        pwContext = nullptr;
+        pwLoop = nullptr;
+
+        wantPlaybackStream = false;
+        wantCaptureStream = false;
+        playbackStreamReady = false;
+        captureStreamReady = false;
+        playbackNodeId = SPA_ID_INVALID;
+        captureNodeId = SPA_ID_INVALID;
+        outputLatencySamples = 0;
+        inputLatencySamples = 0;
+    }
+
+    void detachStreams()
+    {
+        if (playbackStream != nullptr)
+            playbackStream->detached = true;
+
+        if (captureStream != nullptr)
+            captureStream->detached = true;
+    }
+
+    // Returns false if the loop thread refused to stop, in which case nothing
+    // that depends on the loop may be freed and the caller has to try again
     // later.
     bool teardownServerObjects()
     {
-        // The streams have to be destroyed while the core loop is still being
-        // pumped:
-        //
-        // - PipeWire marshals proxy messages through the core loop and blocks
-        //   until that loop has processed them. Destroying a stream from here
-        //   after the loop thread has been stopped therefore never returns
-        //   (measured: pw_stream_destroy() with a stopped loop hangs forever,
-        //   with a running loop it returns in microseconds).
-        // - The stream's process callbacks don't run on that loop: pw_stream
-        //   runs them on the context's data loop, on a thread of its own
-        //   (impl->data_loop = stream->node->data_loop). What keeps them from
-        //   touching a destroyed stream is pw_stream_destroy() itself, which
-        //   flushes that data loop with a blocking pw_loop_locked() before it
-        //   frees anything.
-        //
-        // Running the destroy on the core loop therefore keeps the loop pumped
-        // while this thread waits for the flush to complete, which is what the
-        // first point requires.
-        if (playbackStream != nullptr || captureStream != nullptr)
+        // Everything that touches a stream proxy runs on the loop thread (see
+        // LoopTaskQueue), including the destroy. The task is given the raw
+        // stream pointers, so a task that is still running when this returns
+        // can't reach any member of this object either.
+        auto* playback = playbackStream != nullptr ? playbackStream->stream : nullptr;
+        auto* capture  = captureStream  != nullptr ? captureStream->stream  : nullptr;
+
+        if (playback != nullptr || capture != nullptr)
         {
-            if (audioThread != nullptr && pwLoop != nullptr && audioThread->isThreadRunning())
+            auto finished = std::make_shared<std::atomic<bool>> (false);
+
+            auto handle = serverHandle;
+            const auto generation = handle->generation.load();
+
+            const auto destroyed = runOnLoopThread ([handle, playback, capture, generation, finished]
             {
-                juce::pw_loop_invoke (pwLoop, destroyStreamsOnLoopThread, 0, nullptr, 0, true, this);
-            }
-            else
+                // Retire the connection first: a set_active() task queued after
+                // this one finds a different generation and does nothing with
+                // the pointers it snapped up, which are about to be freed.
+                if (handle->generation.load() == generation)
+                {
+                    handle->playback = nullptr;
+                    handle->capture = nullptr;
+                    ++handle->generation;
+                }
+
+                // pw_stream_destroy() marshals the destroy message and then
+                // flushes the data loop, so it has to run while the loop is
+                // still being pumped - which is what this thread does.
+                if (playback != nullptr)
+                    juce::pw_stream_destroy (playback);
+
+                if (capture != nullptr)
+                    juce::pw_stream_destroy (capture);
+
+                *finished = true;
+            }, streamTaskTimeoutMs);
+
+            if (! destroyed && ! finished->load())
             {
-                // There is no thread pumping the loop, so the destroy would
-                // block forever. This can only happen if the loop thread had
-                // to be abandoned, and dropping the connection below tears the
-                // streams down on the server side anyway.
-                JUCE_PIPEWIRE_LOG ("no loop thread: leaving the streams to the server");
+                JUCE_PIPEWIRE_LOG ("the PipeWire loop thread stopped responding; abandoning its objects");
+                abandonLoopThread();
+                return false;
             }
         }
 
@@ -1590,14 +1864,39 @@ private:
             // the latter force-kills the thread (with pthread_cancel) once the
             // timeout expires, which can leave PipeWire's internal locks in an
             // inconsistent state.
+            if (taskQueue != nullptr)
+                taskQueue->stop();
+
             audioThread->signalThreadShouldExit();
 
             if (! audioThread->waitForThreadToExit (loopThreadStopTimeoutMs))
+            {
+                JUCE_PIPEWIRE_LOG ("the PipeWire loop thread did not stop; abandoning its objects");
+                abandonLoopThread();
                 return false;
+            }
 
             audioThread.reset();
         }
 
+        if (playbackStream != nullptr || captureStream != nullptr)
+        {
+            detachStreams();
+            playbackStream.reset();
+            captureStream.reset();
+        }
+
+        wantPlaybackStream = false;
+        wantCaptureStream = false;
+        playbackStreamReady = false;
+        captureStreamReady = false;
+        playbackNodeId = SPA_ID_INVALID;
+        captureNodeId = SPA_ID_INVALID;
+        outputLatencySamples = 0;
+        inputLatencySamples = 0;
+
+        // Nothing is marshalling messages any more (the only thread that did is
+        // gone), so the rest of the connection can be released from here.
         if (pwCore != nullptr)
         {
             // The listener was registered in setupServerObjects() as soon as the
@@ -1619,6 +1918,9 @@ private:
             pwLoop = nullptr;
         }
 
+        // taskQueue is deliberately left in place: it is created once, the loop
+        // thread holds a reference to it, and setupServerObjects() rearms it for
+        // the next connection.
         return true;
     }
 
@@ -1626,6 +1928,7 @@ private:
     bool createStreamObjects()
     {
         streamsStartedEvent.reset();
+        streamsStreamingEvent.reset();
 
         // These flags are published before any stream exists, so that the state
         // changed callbacks - which run on the loop thread - never have to look
@@ -1634,6 +1937,10 @@ private:
         wantCaptureStream  = ! enabledInputChannels.isZero();
         playbackStreamReady = false;
         captureStreamReady = false;
+        playbackStreaming = false;
+        captureStreamStreaming = false;
+        outputLatencySamples = 0;
+        inputLatencySamples = 0;
 
         if (wantPlaybackStream)
         {
@@ -1665,38 +1972,86 @@ private:
         if (captureStream != nullptr && ! connectStream (*captureStream, sourceNodeId))
             return false;
 
+        // Published only once both streams exist, so that a set_active() that
+        // arrives in between can't see a half-built pair.
+        serverHandle->playback = playbackStream != nullptr ? playbackStream->stream : nullptr;
+        serverHandle->capture  = captureStream  != nullptr ? captureStream->stream  : nullptr;
+        ++serverHandle->generation;
+
         // Preallocate everything the process callbacks need. This has to happen
         // before the streams are activated, which is the caller's job once
         // waitForStreamsToStart() has returned.
         const int outChans = enabledOutputChannels.countNumberOfSetBits();
         const int inChans  = enabledInputChannels.countNumberOfSetBits();
 
-        outputPtrs.calloc ((size_t) jmax (1, outChans) + 2);
-        outputPtrCapacity = jmax (1, outChans) + 2;
-        inputPtrs.calloc ((size_t) jmax (1, inChans) + 2);
-        inputPtrCapacity = jmax (1, inChans) + 2;
+        buffers->outputChannelPointers.calloc ((size_t) jmax (1, outChans) + 2);
+        buffers->outputCapacity = jmax (1, outChans) + 2;
+        buffers->inputChannelPointers.calloc ((size_t) jmax (1, inChans) + 2);
+        buffers->inputCapacity = jmax (1, inChans) + 2;
 
         if (inChans > 0)
-            captureBuffer.setSize (inChans, maxBlockFrames, false, false, true);
+            buffers->capture.setSize (inChans, maxBlockFrames, false, false, true);
 
         return true;
     }
 
+    // Creation and connection both marshal a message into the connection's
+    // buffer, so both run on the loop thread - see LoopTaskQueue.
+    //
+    // Everything a task needs is handed to it by value. A task that is still
+    // running when its caller gave up (see LoopTaskQueue::post()) must not read
+    // any member of this object: by then the device may be gone. The StreamData
+    // it writes into is leaked by abandonLoopThread() for the same reason.
     bool createStream (StreamData& data)
     {
         const auto clientName = "JUCE-PipeWire-" + (data.isCapture ? String ("Input") : String ("Output"))
                                   + "-" + String ((int) ++streamIdCounter);
 
+        auto* const core = pwCore;
+        const auto bufferSize = requestedBufferSize;
+        const auto sampleRate = requestedSampleRate;
+        const auto isCapture = data.isCapture;
+
+        auto created = std::make_shared<bool> (false);
+        auto errorMessage = std::make_shared<String>();
+
+        if (! runOnLoopThread ([&data, core, clientName, isCapture, bufferSize, sampleRate,
+                                created, errorMessage]
+                               {
+                                   *created = createStreamOnLoopThread (data, core, clientName, isCapture,
+                                                                        bufferSize, sampleRate, *errorMessage);
+                               }, streamTaskTimeoutMs))
+        {
+            setLastError ("Timed out waiting for the PipeWire loop thread");
+            abandonLoopThread();
+            return false;
+        }
+
+        if (! *created)
+            setLastError (errorMessage->isNotEmpty() ? *errorMessage
+                                                     : String ("Could not create a PipeWire stream"));
+
+        return *created;
+    }
+
+    static bool createStreamOnLoopThread (StreamData& data,
+                                          struct pw_core* core,
+                                          const String& clientName,
+                                          bool isCapture,
+                                          int bufferSize,
+                                          double sampleRate,
+                                          String& errorMessage)
+    {
         auto* props = createEmptyPipeWireProperties();
 
         if (props == nullptr)
         {
-            setLastError ("Could not create a PipeWire stream");
+            errorMessage = "Could not create a PipeWire stream";
             return false;
         }
 
         juce::pw_properties_set (props, PW_KEY_MEDIA_TYPE, "Audio");
-        juce::pw_properties_set (props, PW_KEY_MEDIA_CATEGORY, data.isCapture ? "Capture" : "Playback");
+        juce::pw_properties_set (props, PW_KEY_MEDIA_CATEGORY, isCapture ? "Capture" : "Playback");
         juce::pw_properties_set (props, PW_KEY_MEDIA_ROLE, "Music");
         juce::pw_properties_set (props, PW_KEY_NODE_NAME, clientName.toRawUTF8());
         juce::pw_properties_set (props, PW_KEY_NODE_DESCRIPTION, clientName.toRawUTF8());
@@ -1706,21 +2061,20 @@ private:
         // host asked for is silently ignored, so getCurrentBufferSizeSamples()
         // would never match getDefaultBufferSize() / the value passed to open().
         // The latency is a fraction of a second, expressed as frames/rate.
-        const auto latency = String (jmax (1, requestedBufferSize)) + "/"
-                               + String (jmax (1, (int) requestedSampleRate));
+        const auto latency = String (jmax (1, bufferSize)) + "/" + String (jmax (1, (int) sampleRate));
         juce::pw_properties_set (props, PW_KEY_NODE_LATENCY, latency.toRawUTF8());
 
         // ... and let the server know which rate we would like the graph to run
         // at when it can be changed.
-        const auto requestedRate = "1/" + String (jmax (1, (int) requestedSampleRate));
+        const auto requestedRate = "1/" + String (jmax (1, (int) sampleRate));
         juce::pw_properties_set (props, PW_KEY_NODE_RATE, requestedRate.toRawUTF8());
 
-        data.stream = juce::pw_stream_new (pwCore, clientName.toRawUTF8(), props);
+        data.stream = juce::pw_stream_new (core, clientName.toRawUTF8(), props);
 
         if (data.stream == nullptr)
         {
             juce::pw_properties_free (props);
-            setLastError ("Could not create a PipeWire stream");
+            errorMessage = "Could not create a PipeWire stream";
             return false;
         }
 
@@ -1730,6 +2084,58 @@ private:
 
     bool connectStream (StreamData& data, uint32_t targetId)
     {
+        // The channel layout is resolved here, not in the task: the task must
+        // not touch the channel name arrays, which belong to this object.
+        struct spa_audio_info_raw info {};
+        info.format = SPA_AUDIO_FORMAT_F32P;
+        info.channels = (uint32_t) data.numChannels;
+
+        {
+            const auto& channelNames = data.isCapture ? inputChannelNames : outputChannelNames;
+            const auto& enabledChannels = data.isCapture ? enabledInputChannels : enabledOutputChannels;
+            int position = 0;
+
+            for (int channel = 0; channel < channelNames.size() && position < (int) SPA_AUDIO_MAX_CHANNELS; ++channel)
+                if (enabledChannels[channel])
+                    info.position[position++] = getChannelPosition (channelNames[channel]);
+        }
+
+        auto* const stream = data.stream;
+        const auto isCapture = data.isCapture;
+        const auto sampleRate = requestedSampleRate;
+        auto connected = std::make_shared<bool> (false);
+        auto errorMessage = std::make_shared<String>();
+
+        if (! runOnLoopThread ([stream, info, isCapture, sampleRate, targetId, connected, errorMessage]
+                               {
+                                   *connected = connectStreamOnLoopThread (stream, info, isCapture, sampleRate,
+                                                                           targetId, *errorMessage);
+                               }, streamTaskTimeoutMs))
+        {
+            setLastError ("Timed out waiting for the PipeWire loop thread");
+            abandonLoopThread();
+            return false;
+        }
+
+        if (! *connected && errorMessage->isNotEmpty())
+            setLastError (*errorMessage);
+
+        return *connected;
+    }
+
+    static bool connectStreamOnLoopThread (struct pw_stream* stream,
+                                           const struct spa_audio_info_raw& requestedInfo,
+                                           bool isCapture,
+                                           double sampleRate,
+                                           uint32_t targetId,
+                                           String& errorMessage)
+    {
+        if (stream == nullptr)
+        {
+            errorMessage = "The PipeWire stream was not created";
+            return false;
+        }
+
         // Build the format pods requesting floating point, non-interleaved
         // audio. The buffer is sized for the maximum number of formats and
         // channels that can be offered below (a format pod is roughly 60 bytes
@@ -1742,18 +2148,7 @@ private:
         auto builder = SPA_POD_BUILDER_INIT (podBuffer, sizeof podBuffer);
         JUCE_END_IGNORE_WARNINGS_GCC_LIKE
 
-        struct spa_audio_info_raw info {};
-        info.format = SPA_AUDIO_FORMAT_F32P;
-        info.channels = (uint32_t) data.numChannels;
-
-        // Preserve the channel positions selected by the caller.
-        const auto& channelNames = data.isCapture ? inputChannelNames : outputChannelNames;
-        const auto& enabledChannels = data.isCapture ? enabledInputChannels : enabledOutputChannels;
-        int position = 0;
-
-        for (int channel = 0; channel < channelNames.size() && position < (int) SPA_AUDIO_MAX_CHANNELS; ++channel)
-            if (enabledChannels[channel])
-                info.position[position++] = getChannelPosition (channelNames[channel]);
+        auto info = requestedInfo;
 
         // Offer every rate that getAvailableSampleRates() advertises - the
         // requested one first - so that a device that can't run at the requested
@@ -1769,7 +2164,7 @@ private:
 
         for (size_t i = 0; i <= offeredRates.size() && numParams < maxNumFormats; ++i)
         {
-            const auto rateToUse = (uint32_t) jmax (1.0, i == 0 ? requestedSampleRate : offeredRates[i - 1]);
+            const auto rateToUse = (uint32_t) jmax (1.0, i == 0 ? sampleRate : offeredRates[i - 1]);
 
             // Skip duplicates: the requested rate is usually one of the common
             // ones, so it appears twice.
@@ -1793,23 +2188,28 @@ private:
 
         if (numParams == 0)
         {
-            setLastError ("Could not build the PipeWire audio format");
+            errorMessage = "Could not build the PipeWire audio format";
             return false;
         }
 
-        const auto direction = data.isCapture ? PW_DIRECTION_INPUT : PW_DIRECTION_OUTPUT;
+        const auto direction = isCapture ? PW_DIRECTION_INPUT : PW_DIRECTION_OUTPUT;
         const auto flags = (enum pw_stream_flags) (PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS);
-        const auto result = juce::pw_stream_connect (data.stream, direction, targetId, flags, params, numParams);
+        const auto result = juce::pw_stream_connect (stream, direction, targetId, flags, params, numParams);
 
         if (result < 0)
         {
-            setLastError ("Could not connect to the PipeWire server (error " + String (-result) + ")");
+            errorMessage = "Could not connect to the PipeWire server (error " + String (-result) + ")";
             return false;
         }
 
-        // The node id may not be assigned yet: pw_stream_connect() is
-        // asynchronous, so it is also refreshed once the stream is ready.
-        refreshStreamNodeId (data);
+        // Resolve pw_stream_get_time() here rather than in the first process
+        // callback: it is a dynamically loaded symbol, and the first call pays
+        // for the lookup.
+        struct pw_time time {};
+
+        if (juce::pw_stream_get_time (stream, &time) == 0)
+            juce::ignoreUnused (time);
+
         return true;
     }
 
@@ -1847,6 +2247,8 @@ private:
         return SPA_AUDIO_CHANNEL_UNKNOWN;
     }
 
+    // Waits until every stream this open() created has reached PW_STREAM_STATE_PAUSED,
+    // which is when the server has finished the format negotiation.
     bool waitForStreamsToStart()
     {
         const auto deadline = Time::getMillisecondCounterHiRes() + (double) streamStartTimeoutMs;
@@ -1870,46 +2272,180 @@ private:
         return false;
     }
 
-    //==============================================================================
-    // Only ever called from the core loop thread (via destroyStreamsOnLoopThread),
-    // one stream at a time. Serialising this with the process callbacks is
-    // pw_stream_destroy()'s job - it flushes the data loop those callbacks run
-    // on - see teardownServerObjects().
-    void destroyStreamObjects()
+    // Waits until a STREAMING transition has arrived after the given generation
+    // was taken, i.e. until the server really linked the graph.
+    //
+    // Waiting for the flags alone would be wrong: they are still set from the
+    // previous take when a host stops and starts the device again, and a server
+    // that drops the activation request would then look like it worked.
+    bool waitForStreamsToBeStreaming (uint64_t generationBefore, int timeoutMs)
     {
-        if (playbackStream != nullptr)
-        {
-            if (playbackStream->stream != nullptr)
-                juce::pw_stream_destroy (playbackStream->stream);
+        const auto deadline = Time::getMillisecondCounterHiRes() + (double) timeoutMs;
 
-            playbackStream.reset();
+        while (Time::getMillisecondCounterHiRes() < deadline)
+        {
+            if (streamingGeneration.load() != generationBefore && areAllWantedStreamsStreaming())
+                return true;
+
+            if (isCallingThreadBeingStopped())
+                return false;
+
+            streamsStreamingEvent.wait (10);
         }
 
-        if (captureStream != nullptr)
-        {
-            if (captureStream->stream != nullptr)
-                juce::pw_stream_destroy (captureStream->stream);
-
-            captureStream.reset();
-        }
-
-        wantPlaybackStream = false;
-        wantCaptureStream = false;
-        playbackStreamReady = false;
-        captureStreamReady = false;
-        playbackNodeId = SPA_ID_INVALID;
-        captureNodeId = SPA_ID_INVALID;
+        return streamingGeneration.load() != generationBefore && areAllWantedStreamsStreaming();
     }
 
-    void setActive (bool shouldBeActive)
+    bool areAllWantedStreamsStreaming() const
     {
-        const ScopedLock sl (lifecycleLock);
+        return (! wantPlaybackStream.load() || playbackStreaming.load())
+            && (! wantCaptureStream.load()  || captureStreamStreaming.load());
+    }
 
-        if (playbackStream != nullptr && playbackStream->stream != nullptr)
-            juce::pw_stream_set_active (playbackStream->stream, shouldBeActive);
+    // Starts or stops the streams and, when starting, waits until they are
+    // really streaming.
+    //
+    // This is the difference between "the server was asked to play" and "the
+    // host is being fed": pw_stream_set_active() only queues the request, and a
+    // request that arrives before the graph has linked the node is dropped by
+    // the server. The device would then report isPlaying() while never calling
+    // back, which is the failure that made hosts appear to be playing silence.
+    void requestActive (bool shouldBeActive)
+    {
+        if (! shouldBeActive)
+        {
+            setPlaying (false);
+            setActive (false);
+            playbackStreaming = false;
+            captureStreamStreaming = false;
+            return;
+        }
 
-        if (captureStream != nullptr && captureStream->stream != nullptr)
-            juce::pw_stream_set_active (captureStream->stream, shouldBeActive);
+        for (int attempt = 0; attempt < numStartAttempts; ++attempt)
+        {
+            if (attempt > 0)
+            {
+                // pw_impl_node_set_active() ignores a request that doesn't change
+                // the node's state, so activating an already active node never
+                // re-issues the Start command. Taking it down first is what makes
+                // the retry an actual retry.
+                setActive (false);
+            }
+
+            const auto generationBefore = streamingGeneration.load();
+
+            if (! setActive (true))
+                continue;
+
+            if (waitForStreamsToBeStreaming (generationBefore, startHandshakeTimeoutMs))
+            {
+                // A stream error or a lost server can land while the handshake is
+                // waiting; those latches are set before the flags below, so
+                // checking them keeps the device from claiming to play when the
+                // stream has already failed.
+                if (! streamErrorNotified.load() && ! serverLost.load())
+                {
+                    setPlaying (true);
+
+                    // A previous failure may have left the notify/rebuild flags
+                    // set; the streams are running now, so the monitor thread must
+                    // not tear them down and tell the host that the device
+                    // stopped.
+                    pendingErrorNotify = false;
+                    pendingRestart = false;
+                    clearRebuildBackoff();
+                    return;
+                }
+
+                break;
+            }
+
+            if (getLastErrorCopy().isEmpty())
+                setLastError ("The PipeWire server did not start the streams");
+
+            if (isCallingThreadBeingStopped())
+                break;
+        }
+
+        // The streams are not running, so claiming to play would make the host
+        // show a running device that delivers nothing. The monitor thread
+        // notifies the host about the failure and rebuilds the streams.
+        setPlaying (false);
+        pendingErrorNotify = true;
+        pendingRestart = true;
+    }
+
+    void setPlaying (bool shouldBePlaying)
+    {
+        isPlaying_ = shouldBePlaying;
+    }
+
+    // Posts the activation request to the loop thread. The stream pointers and
+    // the generation are taken from the shared handle, so this never reads a
+    // member of an object that may be gone, and a request that lost the race
+    // against a teardown turns into a no-op instead of touching freed streams.
+    bool setActive (bool shouldBeActive)
+    {
+        auto handle = serverHandle;
+
+        // Both writers - createStreamObjects() and the destroy task - publish
+        // the pointers first and bump the generation afterwards, so a generation
+        // that doesn't move while the pointers are read means they belong to it.
+        uint64_t generation = 0;
+        struct pw_stream* playback = nullptr;
+        struct pw_stream* capture = nullptr;
+
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            generation = handle->generation.load();
+            playback = handle->playback.load();
+            capture = handle->capture.load();
+
+            if (handle->generation.load() == generation)
+                break;
+        }
+
+        if (playback == nullptr && capture == nullptr)
+            return true;
+
+        auto result = std::make_shared<int> (0);
+
+        if (! runOnLoopThread ([handle, playback, capture, generation, shouldBeActive, result]
+                               {
+                                   if (handle->generation.load() != generation)
+                                       return;
+
+                                   *result = setStreamsActiveOnLoopThread (playback, capture, shouldBeActive);
+                               }, streamTaskTimeoutMs))
+        {
+            setLastError ("Timed out waiting for the PipeWire loop thread");
+            return false;
+        }
+
+        return *result >= 0;
+    }
+
+    // Runs on the loop thread. pw_stream_set_active() only touches the local
+    // node and takes the stream's data-loop lock, so it is cheap - but it must
+    // still happen on the loop thread, which is where the node state lives.
+    static int setStreamsActiveOnLoopThread (struct pw_stream* playback,
+                                             struct pw_stream* capture,
+                                             bool shouldBeActive)
+    {
+        int result = 0;
+
+        if (playback != nullptr)
+            result = juce::pw_stream_set_active (playback, shouldBeActive);
+
+        if (capture != nullptr)
+        {
+            const auto captureResult = juce::pw_stream_set_active (capture, shouldBeActive);
+
+            if (result >= 0)
+                result = captureResult;
+        }
+
+        return result;
     }
 
     //==============================================================================
@@ -1926,17 +2462,23 @@ private:
                                        enum pw_stream_state state, const char* error)
             {
                 auto& streamData = *static_cast<StreamData*> (data);
-                streamData.owner->handleStreamStateChanged (streamData, state, error);
+
+                if (! streamData.detached.load (std::memory_order_acquire))
+                    streamData.owner->handleStreamStateChanged (streamData, state, error);
             };
             result.param_changed = [] (void* data, uint32_t, const struct spa_pod* param)
             {
                 auto& streamData = *static_cast<StreamData*> (data);
-                streamData.owner->handleStreamParamChanged (param);
+
+                if (! streamData.detached.load (std::memory_order_acquire))
+                    streamData.owner->handleStreamParamChanged (param);
             };
             result.process = [] (void* data)
             {
                 auto& streamData = *static_cast<StreamData*> (data);
-                streamData.owner->handleStreamProcess (streamData);
+
+                if (! streamData.detached.load (std::memory_order_acquire))
+                    streamData.owner->handleStreamProcess (streamData);
             };
             return result;
         }();
@@ -2011,9 +2553,15 @@ private:
             refreshStreamNodeId (data);
 
             if (data.isCapture)
+            {
                 captureStreamReady = true;
+                captureStreamStreaming = false;
+            }
             else
+            {
                 playbackStreamReady = true;
+                playbackStreaming = false;
+            }
 
             // This runs on the loop thread and only reads atomics: the control
             // thread may still be publishing the other stream, so the stream
@@ -2023,6 +2571,36 @@ private:
 
             if (allStreamsReady)
                 streamsStartedEvent.signal();
+        }
+        else if (state == PW_STREAM_STATE_STREAMING)
+        {
+            refreshStreamNodeId (data);
+
+            if (data.isCapture)
+                captureStreamStreaming = true;
+            else
+                playbackStreaming = true;
+
+            // The handshake in requestActive() waits for this: a stream that
+            // stays paused after being activated is one the server never linked,
+            // and its process callback would never run. The generation makes
+            // sure it waits for a transition that happened after the request,
+            // not for a flag left over from the previous take.
+            streamingGeneration.fetch_add (1);
+            streamsStreamingEvent.signal();
+        }
+        else if (state == PW_STREAM_STATE_UNCONNECTED || state == PW_STREAM_STATE_CONNECTING)
+        {
+            if (data.isCapture)
+            {
+                captureStreamReady = false;
+                captureStreamStreaming = false;
+            }
+            else
+            {
+                playbackStreamReady = false;
+                playbackStreaming = false;
+            }
         }
     }
 
@@ -2148,7 +2726,7 @@ private:
         auto* spaBuffer = buffer->buffer;
         const auto numSamples = getPlaybackNumSamples (*buffer, maxBlockFrames);
         const auto numChannels = jmin ((int) spaBuffer->n_datas,
-                                       outputPtrCapacity,
+                                       buffers->outputCapacity,
                                        enabledOutputChannels.countNumberOfSetBits());
 
         if (numSamples <= 0 || numChannels <= 0)
@@ -2161,18 +2739,18 @@ private:
         currentBufferSize = numSamples;
 
         for (int i = 0; i < numChannels; ++i)
-            outputPtrs[i] = getPlaneSamples (spaBuffer->datas[i]);
+            buffers->outputChannelPointers[i] = getPlaneSamples (spaBuffer->datas[i]);
 
         // If we're recording as well as playing, point the input channels at
         // the data that was captured in the most recent capture callback.
-        const auto numInputChannels = captureBuffer.getNumChannels();
+        const auto numInputChannels = buffers->capture.getNumChannels();
         float** inputData = nullptr;
 
         if (numInputChannels > 0)
         {
-            inputData = inputPtrs.getData();
+            inputData = buffers->inputChannelPointers.getData();
 
-            if (captureBuffer.getNumSamples() < numSamples)
+            if (buffers->capture.getNumSamples() < numSamples)
             {
                 // The capture buffer is smaller than the playback block, which
                 // shouldn't normally happen. Discard the captured data and hand
@@ -2180,25 +2758,25 @@ private:
                 // block, and passing that on would repeat a chunk of audio.
                 // AudioBuffer::clear() doesn't clamp its range, so it is
                 // clamped here.
-                captureBuffer.clear (0, jmin (numSamples, captureBuffer.getNumSamples()));
-                captureSamples = 0;
+                buffers->capture.clear (0, jmin (numSamples, buffers->capture.getNumSamples()));
+                buffers->captureSamples = 0;
                 xruns++;
             }
-            else if (captureSamples > numSamples)
+            else if (buffers->captureSamples > numSamples)
             {
-                captureSamples = numSamples;
+                buffers->captureSamples = numSamples;
             }
-            else if (captureSamples < numSamples)
+            else if (buffers->captureSamples < numSamples)
             {
-                captureBuffer.clear (captureSamples, numSamples - captureSamples);
+                buffers->capture.clear (buffers->captureSamples, numSamples - buffers->captureSamples);
             }
 
             for (int i = 0; i < numInputChannels; ++i)
-                inputPtrs[i] = const_cast<float*> (captureBuffer.getReadPointer (i, 0));
+                buffers->inputChannelPointers[i] = const_cast<float*> (buffers->capture.getReadPointer (i, 0));
         }
 
         invokeCallback (inputData, numInputChannels,
-                        outputPtrs.getData(), numChannels,
+                        buffers->outputChannelPointers.getData(), numChannels,
                         numSamples);
 
         for (uint32_t i = 0; i < spaBuffer->n_datas; ++i)
@@ -2210,8 +2788,9 @@ private:
             }
         }
 
-        captureSamples = 0;
+        buffers->captureSamples = 0;
         juce::pw_stream_queue_buffer (data.stream, buffer);
+        publishLatency (data);
     }
 
     void processCapture (StreamData& data)
@@ -2227,7 +2806,7 @@ private:
         auto* spaBuffer = buffer->buffer;
         const auto numSamples = getCaptureNumSamples (*buffer, maxBlockFrames);
         const auto numChannels = jmin ((int) spaBuffer->n_datas,
-                                       inputPtrCapacity,
+                                       buffers->inputCapacity,
                                        enabledInputChannels.countNumberOfSetBits());
 
         if (numSamples <= 0 || numChannels <= 0)
@@ -2250,72 +2829,102 @@ private:
             currentBufferSize = numSamples;
 
             for (int i = 0; i < numChannels; ++i)
-                inputPtrs[i] = getPlaneSamples (spaBuffer->datas[i]);
+                buffers->inputChannelPointers[i] = getPlaneSamples (spaBuffer->datas[i]);
 
-            invokeCallback (inputPtrs.getData(), numChannels, nullptr, 0, numSamples);
+            invokeCallback (buffers->inputChannelPointers.getData(), numChannels, nullptr, 0, numSamples);
         }
         else
         {
-            if (numChannels > captureBuffer.getNumChannels() || numSamples > captureBuffer.getNumSamples())
+            if (numChannels > buffers->capture.getNumChannels() || numSamples > buffers->capture.getNumSamples())
             {
-                captureSamples = 0;
+                buffers->captureSamples = 0;
                 xruns++;
             }
             else
             {
-                captureBuffer.clear (0, numSamples);
+                buffers->capture.clear (0, numSamples);
 
                 for (int i = 0; i < numChannels; ++i)
                     if (auto* src = getPlaneSamples (spaBuffer->datas[i]))
-                        memcpy (captureBuffer.getWritePointer (i, 0), src,
+                        memcpy (buffers->capture.getWritePointer (i, 0), src,
                                 (size_t) numSamples * sizeof (float));
 
-                captureSamples = numSamples;
+                buffers->captureSamples = numSamples;
             }
         }
 
         juce::pw_stream_queue_buffer (data.stream, buffer);
+        publishLatency (data);
     }
 
     //==============================================================================
-    static int getLatencyInSamples (struct pw_stream* stream, double sampleRateForStream)
+    // Converts a pw_time snapshot into samples at the stream's own rate.
+    //
+    // pw_time.delay is expressed in ticks, and the duration of a tick is given
+    // by the rate fraction (documented as "usually 1/<samplerate>"). Assuming
+    // that a tick is always one sample would be out by a large factor whenever
+    // the stream is running at a different rate from the graph, so convert
+    // explicitly.
+    static int getLatencyInSamples (const struct pw_time& time, double sampleRateForStream)
     {
-        struct pw_time time {};
-
-        if (juce::pw_stream_get_time (stream, &time) != 0 || time.delay <= 0)
-            return 0;
-
-        // pw_time.delay is expressed in ticks, and the duration of a tick is
-        // given by the rate fraction (documented as "usually 1/<samplerate>").
-        // Assuming that a tick is always one sample would be out by a large
-        // factor whenever the stream is running at a different rate from the
-        // graph, so convert explicitly.
-        if (time.rate.num == 0 || time.rate.denom == 0 || sampleRateForStream <= 0.0)
+        if (time.delay <= 0 || time.rate.num == 0 || time.rate.denom == 0 || sampleRateForStream <= 0.0)
             return 0;
 
         const auto delaySeconds = (double) time.delay * (double) time.rate.num / (double) time.rate.denom;
-        const auto delaySamples = delaySeconds * sampleRateForStream;
 
-        return (int) jlimit (0.0, (double) std::numeric_limits<int>::max(), delaySamples);
+        return (int) jlimit (0.0, (double) std::numeric_limits<int>::max(), delaySeconds * sampleRateForStream);
+    }
+
+    // Samples the reported latency from a process callback and publishes it.
+    // pw_stream_get_time() is documented as realtime safe and doesn't take the
+    // lifecycle lock, which is what lets the latency getters be lock-free - see
+    // getOutputLatencyInSamples().
+    void publishLatency (StreamData& data)
+    {
+        struct pw_time time {};
+
+        if (juce::pw_stream_get_time (data.stream, &time) != 0)
+            return;
+
+        const auto latency = getLatencyInSamples (time, currentSampleRate.load());
+
+        if (data.isCapture)
+            inputLatencySamples.store (latency, std::memory_order_relaxed);
+        else
+            outputLatencySamples.store (latency, std::memory_order_relaxed);
     }
 
     //==============================================================================
+    // Pumps the loop and runs the work the control thread has posted. It holds
+    // nothing but the loop and the queue, so a stuck instance can be abandoned
+    // without leaving this object's members dangling (see abandonLoopThread()).
     class AudioThread final : public Thread
     {
     public:
-        explicit AudioThread (PipeWireAudioIODevice& ownerToUse)
-            : Thread ("PipeWire Audio"), owner (ownerToUse)
+        AudioThread (struct pw_loop* loopToPump, std::shared_ptr<LoopTaskQueue> queueToUse)
+            : Thread ("PipeWire Audio"), loop (loopToPump), queue (std::move (queueToUse))
         {
         }
 
         void run() override
         {
+            queue->enterLoopThread();
+
             while (! threadShouldExit())
-                juce::pw_loop_iterate (owner.pwLoop, 100);
+            {
+                // Serving the queue before pumping keeps this the only thread
+                // that ever touches the connection, apart from the process
+                // callbacks below.
+                queue->runPending();
+                juce::pw_loop_iterate (loop, 20);
+            }
+
+            queue->leaveLoopThread();
         }
 
     private:
-        PipeWireAudioIODevice& owner;
+        struct pw_loop* loop = nullptr;
+        std::shared_ptr<LoopTaskQueue> queue;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioThread)
     };
@@ -2506,6 +3115,11 @@ private:
     // once per monitor cycle.
     bool canAttemptRebuild() const
     {
+        // A device whose loop thread had to be abandoned is left alone: every
+        // rebuild attempt would leak another thread, connection and stream pair.
+        if (loopAbandoned.load())
+            return false;
+
         return Time::getMillisecondCounterHiRes() >= nextRebuildAttemptTime;
     }
 
@@ -2570,6 +3184,13 @@ private:
 
             if (shuttingDown.load() || ! isOpen_.load())
                 return true;
+
+            // The streams of an abandoned connection are still owned by a thread
+            // that could not be stopped: building a second set on top of them
+            // would leak another connection, and read the buffers that were kept
+            // for the first one.
+            if (loopAbandoned.load())
+                return false;
 
             shouldResume = resumeAfterwards ? (resumeAfterRecovery.load() || isPlaying_.load())
                                             : isPlaying_.load();
@@ -2642,31 +3263,35 @@ private:
             if (auto* cb = callback.load (std::memory_order_acquire))
                 cb->audioDeviceAboutToStart (this);
 
+        // The rebuild worked, so start the retry backoff from scratch.
         {
             const ScopedLock sl (lifecycleLock);
-
-            if (shuttingDown.load() || ! isOpen_.load())
-                return true;
-
-            // The rebuild worked, so start the retry backoff from scratch.
             clearRebuildBackoff();
-
             resumeAfterRecovery = false;
+        }
 
-            // The callback is re-checked under the lock because the host may
-            // have started us again while the streams were being rebuilt.
-            if (shouldResume && callback.load (std::memory_order_acquire) != nullptr)
+        if (shuttingDown.load() || ! isOpen_.load())
+            return true;
+
+        // Resuming goes through the same handshake as start(): the host may have
+        // started us again while the streams were being rebuilt, but claiming to
+        // be playing without the server actually dispatching would leave it with
+        // a silently dead device.
+        if (shouldResume && callback.load (std::memory_order_acquire) != nullptr)
+        {
+            requestActive (true);
+
+            if (! isPlaying_.load())
             {
-                setActive (true);
-                isPlaying_ = true;
+                // The caller retries with a growing delay, so a server that is
+                // not ready yet doesn't get hammered once per monitor cycle.
+                needsRebuildAfterLoss = true;
+                return false;
             }
-            else if (shouldResume)
-            {
-                // There is nothing to deliver audio to - the host has already
-                // been told that the device stopped - so don't report ourselves
-                // as playing.
-                isPlaying_ = false;
-            }
+        }
+        else
+        {
+            isPlaying_ = false;
         }
 
         return true;
@@ -2680,20 +3305,15 @@ private:
     String lastError;
     mutable CriticalSection errorLock;
 
-    // Serialises open/close and the monitor thread's restarts. start() and
-    // stop() take it too (for setActive(), which round-trips through the loop),
-    // as do the two latency queries.
+    // Serialises open/close and the monitor thread's restarts, and the state
+    // changes start()/stop() make.
     //
     // The waits for the server at the end of open() and in restartServerSide()
-    // deliberately happen without it, but the teardown and the stream creation
-    // do not: destroying the streams waits for the PipeWire loop thread (up to
-    // loopThreadStopTimeoutMs per attempt) and pw_stream_connect() blocks until
-    // that loop has marshalled it. A rebuild therefore holds this for seconds,
-    // and every caller has to be able to afford that - the queries that only
-    // want to know which sink is being followed included.
-    //
-    // That is why nothing reachable from a realtime thread may take it, and why
-    // the class comment lists the handful of queries that are allowed there.
+    // deliberately happen without it. The teardown and the stream creation do
+    // hold it, and both of those round-trip through the loop thread (up to
+    // streamTaskTimeoutMs), so a rebuild can hold this lock for seconds. That is
+    // why nothing reachable from a realtime thread may take it - the latency
+    // queries used to, and are now lock-free (see getOutputLatencyInSamples()).
     CriticalSection lifecycleLock;
 
     // Serialises callback swaps. Never taken while lifecycleLock is held.
@@ -2725,36 +3345,66 @@ private:
     std::atomic<bool> resumeAfterRecovery { false }, pendingLostNotify { false }, needsRebuildAfterLoss { false };
     std::atomic<bool> pendingErrorNotify { false };
 
-    // Which streams this open() created, and which of them have reached the
-    // paused state. These let the loop thread work out whether both streams are
-    // running without touching the stream pointers, which the control thread
-    // may be publishing at the same time.
+    // Which streams this open() created, which of them have reached the paused
+    // state and which are really streaming. These let the loop thread work out
+    // whether both streams are running without touching the stream pointers,
+    // which the control thread may be publishing at the same time.
     std::atomic<bool> wantPlaybackStream { false }, wantCaptureStream { false };
     std::atomic<bool> playbackStreamReady { false }, captureStreamReady { false };
+    std::atomic<bool> playbackStreaming { false }, captureStreamStreaming { false };
+
+    // Bumped by the loop thread on every STREAMING transition; the start
+    // handshake waits for it to move (see waitForStreamsToBeStreaming()).
+    std::atomic<uint64_t> streamingGeneration { 0 };
+
+    // Set when the loop thread had to be abandoned - see abandonLoopThread().
+    std::atomic<bool> loopAbandoned { false };
+
+    // Published by the process callbacks so that the latency queries are
+    // lock-free - see publishLatency().
+    std::atomic<int> outputLatencySamples { 0 }, inputLatencySamples { 0 };
 
     // Exponential backoff for rebuild attempts after the server went away.
-    double nextRebuildAttemptTime = 0.0;
-    int rebuildBackoffMs = 1000;
+    // Written by the monitor thread and by requestActive(), so these are
+    // atomics rather than plain members.
+    std::atomic<double> nextRebuildAttemptTime { 0.0 };
+    std::atomic<int> rebuildBackoffMs { 1000 };
 
     std::unique_ptr<StreamData> playbackStream, captureStream;
     std::unique_ptr<AudioThread> audioThread;
     std::unique_ptr<MonitorThread> monitorThread;
+
+    // Created once and never replaced: the loop thread holds its own reference,
+    // so it has to survive the connection it was created for.
+    std::shared_ptr<LoopTaskQueue> taskQueue = std::make_shared<LoopTaskQueue>();
+    std::shared_ptr<ServerHandle> serverHandle = std::make_shared<ServerHandle>();
 
     struct pw_loop* pwLoop = nullptr;
     struct pw_context* pwContext = nullptr;
     struct pw_core* pwCore = nullptr;
     struct spa_hook coreListener {};
 
-    HeapBlock<float*> outputPtrs, inputPtrs;
-    int outputPtrCapacity = 0, inputPtrCapacity = 0;
+    // Everything a process callback needs to build its channel pointers. It is
+    // held through a pointer so that an abandoned connection can leak it whole -
+    // see the destructor.
+    struct ProcessBuffers
+    {
+        HeapBlock<float*> outputChannelPointers, inputChannelPointers;
+        int outputCapacity = 0, inputCapacity = 0;
 
-    // Written by the capture stream's process callback and read by the playback
-    // one. Those run on the same thread for as long as the context has a single
-    // data loop, which is the default (context.num-data-loops == 1). With more
-    // than one data loop the two streams can be dispatched on different threads,
-    // and this would have to become a lock-free hand-over instead.
-    AudioBuffer<float> captureBuffer;
-    int captureSamples = 0;
+        // Written by the capture stream's process callback and read by the
+        // playback one. Those run on the same thread for as long as the context
+        // has a single data loop, which is the default
+        // (context.num-data-loops == 1). With more than one data loop the two
+        // streams could be dispatched on different threads, and this would have
+        // to become a lock-free hand-over instead.
+        AudioBuffer<float> capture;
+        int captureSamples = 0;
+    };
+
+    std::unique_ptr<ProcessBuffers> buffers = std::make_unique<ProcessBuffers>();
+    bool buffersLeaked = false;
+
     int maxBlockFrames = 8192;
 
     double requestedSampleRate = 48000.0;
@@ -2769,10 +3419,17 @@ private:
     String currentDefaultSinkKey, currentDefaultSourceKey;
 
     BigInteger enabledInputChannels, enabledOutputChannels;
-    WaitableEvent streamsStartedEvent;
+    WaitableEvent streamsStartedEvent, streamsStreamingEvent;
 
     static constexpr int streamStartTimeoutMs = 10000;
     static constexpr int loopThreadStopTimeoutMs = 2000;
+
+    // How long the control thread waits for the loop thread to run a task it
+    // posted. Every one of those is a handful of messages to the server, so
+    // anything close to this means the loop is stuck.
+    static constexpr int streamTaskTimeoutMs = 2000;
+    static constexpr int startHandshakeTimeoutMs = 1200;
+    static constexpr int numStartAttempts = 2;
     static constexpr int maxRebuildBackoffMs = 30000;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PipeWireAudioIODevice)
@@ -2786,22 +3443,33 @@ public:
     PipeWireAudioIODeviceType()
         : AudioIODeviceType ("PipeWire")
     {
-        watcher = std::make_unique<DeviceListWatcher> (*this);
-        watcher->startThread (Thread::Priority::low);
+        // The watcher is started by the first scanForDevices(): every
+        // AudioDeviceManager creates this type, including the many hosts and
+        // plug-ins that never touch PipeWire, and a thread that connects to the
+        // server every second for the lifetime of the process is a real cost on
+        // a laptop. Nothing is watched before somebody has asked for the list.
     }
 
     ~PipeWireAudioIODeviceType() override
     {
-        if (watcher != nullptr)
+        std::unique_ptr<DeviceListWatcher> watcherToStop;
+
+        {
+            const ScopedLock sl (watcherLock);
+            watcherToStop = std::move (watcher);
+            watcherStopped = true;
+        }
+
+        if (watcherToStop != nullptr)
         {
             // Never force-kill the watcher: it may be in the middle of a
             // PipeWire call, and the scan abandons itself once the thread has
             // been asked to stop.
-            watcher->signalThreadShouldExit();
+            watcherToStop->signalThreadShouldExit();
 
-            if (watcher->waitForThreadToExit (threadStopTimeoutMs))
+            if (watcherToStop->waitForThreadToExit (threadStopTimeoutMs))
             {
-                watcher.reset();
+                watcherToStop.reset();
             }
             else
             {
@@ -2822,6 +3490,8 @@ public:
     // getDeviceNames()/createDevice() - until the server answers.
     void scanForDevices() override
     {
+        startWatcherIfNeeded();
+
         DeviceListSnapshot newSnapshot;
         PipeWireScanResult result;
 
@@ -2915,6 +3585,19 @@ public:
     }
 
 private:
+    //==============================================================================
+    // Created on the first scan and never before - see the constructor.
+    void startWatcherIfNeeded()
+    {
+        const ScopedLock sl (watcherLock);
+
+        if (watcher != nullptr || watcherStopped)
+            return;
+
+        watcher = std::make_unique<DeviceListWatcher> (*this);
+        watcher->startThread (Thread::Priority::low);
+    }
+
     //==============================================================================
     // PipeWire sends registry changes over the socket, but the JUCE device list
     // only needs to be refreshed occasionally, so we poll the graph and tell
@@ -3039,7 +3722,11 @@ private:
 
     StringArray lastOutputNames, lastInputNames;
     bool hasComparedList = false;
+
+    // Created by the first scanForDevices() - see the constructor.
     std::unique_ptr<DeviceListWatcher> watcher;
+    CriticalSection watcherLock;
+    bool watcherStopped = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PipeWireAudioIODeviceType)
 };
