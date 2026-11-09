@@ -1295,6 +1295,16 @@ private:
         std::atomic<bool> detached { false };
     };
 
+    // The core listener lives on the heap and holds the owner behind an atomic:
+    // a connection that had to be abandoned keeps receiving events from the
+    // loop thread, and it must be able to find out that the device is gone
+    // without the controller having to unlink the hook from another thread.
+    struct CoreListener
+    {
+        struct spa_hook hook {};
+        std::atomic<PipeWireAudioIODevice*> owner { nullptr };
+    };
+
     // The stream pointers and a generation counter, shared with the tasks the
     // control thread posts to the loop thread. A task holds its own reference,
     // so it can be executed after the device that posted it is gone, and the
@@ -1717,7 +1727,9 @@ private:
             return false;
         }
 
-        juce::pw_core_add_listener (pwCore, &coreListener, &getDeviceCoreEvents(), this);
+        coreListener = new CoreListener();
+        coreListener->owner = this;
+        juce::pw_core_add_listener (pwCore, &coreListener->hook, &getDeviceCoreEvents(), coreListener);
 
         // The loop thread dispatches PipeWire's messages and runs the work the
         // control thread posts to it - see LoopTaskQueue. It holds nothing but
@@ -1753,13 +1765,17 @@ private:
     {
         detachStreams();
 
-        // The listener's user data is this object, which may be destroyed while
-        // the leaked loop thread keeps running: detach it first.
-        if (pwCore != nullptr)
+        // The leaked loop thread can still deliver events for this connection.
+        // Clearing the owner leaves the listener in place but harmless, which is
+        // what makes it safe to do from here - unlinking the hook while the loop
+        // thread walks its hook list is not.
+        if (coreListener != nullptr)
         {
-            spa_hook_remove (&coreListener);
-            pwCore = nullptr;
+            coreListener->owner = nullptr;
+            coreListener = nullptr;
         }
+
+        pwCore = nullptr;
 
         // Any task that is still queued or running now sees a different
         // generation and does nothing with its snapshot of the stream pointers.
@@ -1897,11 +1913,17 @@ private:
 
         // Nothing is marshalling messages any more (the only thread that did is
         // gone), so the rest of the connection can be released from here.
+        if (coreListener != nullptr)
+        {
+            // Safe here: the loop thread that dispatches these events has already
+            // been joined.
+            spa_hook_remove (&coreListener->hook);
+            delete coreListener;
+            coreListener = nullptr;
+        }
+
         if (pwCore != nullptr)
         {
-            // The listener was registered in setupServerObjects() as soon as the
-            // connection succeeded, so it is always safe to remove it here.
-            spa_hook_remove (&coreListener);
             juce::pw_core_disconnect (pwCore);
             pwCore = nullptr;
         }
@@ -2494,7 +2516,11 @@ private:
             result.version = PW_VERSION_CORE_EVENTS;
             result.error = [] (void* data, uint32_t, int, int, const char*)
             {
-                static_cast<PipeWireAudioIODevice*> (data)->handleServerLost();
+                // The owner is cleared when the connection is abandoned, which
+                // can happen while this thread is running.
+                if (auto* listener = static_cast<CoreListener*> (data))
+                    if (auto* owner = listener->owner.load())
+                        owner->handleServerLost();
             };
             return result;
         }();
@@ -3382,7 +3408,7 @@ private:
     struct pw_loop* pwLoop = nullptr;
     struct pw_context* pwContext = nullptr;
     struct pw_core* pwCore = nullptr;
-    struct spa_hook coreListener {};
+    CoreListener* coreListener = nullptr;   // never freed once abandoned - see abandonLoopThread()
 
     // Everything a process callback needs to build its channel pointers. It is
     // held through a pointer so that an abandoned connection can leak it whole -
