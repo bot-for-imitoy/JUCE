@@ -2067,8 +2067,11 @@ private:
             if (data.data == nullptr || data.chunk == nullptr || data.maxsize < sizeof (float))
                 return 0;
 
-            const auto valid = data.chunk->stride > 0 ? (int) (data.chunk->size / data.chunk->stride)
-                                                       : (int) (data.chunk->size / 4);
+            // A positive stride is the size of one frame in bytes; anything
+            // else is treated as 4 (one float per channel). The division is
+            // done in unsigned arithmetic because chunk->size is a uint32_t.
+            const auto stride = data.chunk->stride > 0 ? (uint32_t) data.chunk->stride : 4u;
+            const auto valid = (int) (data.chunk->size / stride);
             frames = jmin (frames, jmin (valid, getPlaneMaxFrames (data)));
         }
 
