@@ -1666,6 +1666,14 @@ private:
     // later.
     bool teardownServerObjects()
     {
+        // Nothing was ever connected, which is the normal state of a device that
+        // was created and then destroyed without being opened - enumerating the
+        // device list does that for every node. There is nothing to release, and
+        // saying so would be worse than saying nothing: the branch below claims
+        // the loop thread had to be abandoned, which it never existed.
+        if (pwCore == nullptr && audioThread == nullptr && pwLoop == nullptr && pwContext == nullptr)
+            return true;
+
         // The streams and the connection have to be torn down while the core
         // loop is still being pumped:
         //
