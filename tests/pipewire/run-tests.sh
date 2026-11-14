@@ -15,6 +15,10 @@
 #   ./run-tests.sh hotplug      # one test
 #   ./run-tests.sh --list       # list the tests
 #
+# churn.sh repeats the open-close test until something breaks (20 runs is 1000
+# open/close cycles), and restart-repeat.sh runs the restart test several times
+# to check that the recovery is reliable rather than lucky.
+#
 # Environment:
 #   PIPEWIRE_TEST_BIN   path to the test binary (defaults to the build tree)
 #   KEEP_TEST_NODES=1   leave the temporary nodes in the graph afterwards
