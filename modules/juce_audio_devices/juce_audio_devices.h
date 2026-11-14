@@ -176,6 +176,34 @@
  #define JUCE_JACK 0
 #endif
 
+/** Config: JUCE_PIPEWIRE
+    Enables native PipeWire audio devices (Linux only). This is disabled by
+    default.
+
+    This uses libpipewire-0.3, which is loaded dynamically at runtime, so no
+    extra library needs to be linked against your app. You will still need to
+    have the PipeWire development headers installed in order to compile with
+    this flag enabled. The package you need to install is "libpipewire-0.3-dev".
+
+    The headers are installed outside of the default include path (usually in
+    /usr/include/pipewire-0.3 and /usr/include/spa-0.2), so these directories
+    have to be added to the include path of your build as well.
+
+    If you have PipeWire installed and want to use it, set the JUCE_PIPEWIRE
+    flag to 1.
+
+    Enabling this flag also makes PipeWire the preferred default device type
+    on Linux: PipeWire is registered ahead of ALSA and JACK, so wherever
+    AudioDeviceManager picks a type on its own it may now prefer PipeWire over
+    either of them. A saved AudioDeviceManager XML state that does not pin a
+    device type that still works on the current system may therefore switch
+    from ALSA to PipeWire. A state that pins a device type that still works on
+    the current system keeps using it.
+*/
+#ifndef JUCE_PIPEWIRE
+ #define JUCE_PIPEWIRE 0
+#endif
+
 /** Config: JUCE_USE_ANDROID_OBOE
     Enables Oboe devices (Android only).
 */

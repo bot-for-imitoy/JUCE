@@ -106,6 +106,12 @@ void AudioIODeviceType::callDeviceChangeListeners()
  AudioIODeviceType* AudioIODeviceType::createAudioIODeviceType_JACK()         { return nullptr; }
 #endif
 
+#if JUCE_LINUX && JUCE_PIPEWIRE
+ AudioIODeviceType* AudioIODeviceType::createAudioIODeviceType_PipeWire()     { return createAudioIODeviceType_PipeWire_Native(); }
+#else
+ AudioIODeviceType* AudioIODeviceType::createAudioIODeviceType_PipeWire()     { return nullptr; }
+#endif
+
 #if JUCE_ANDROID
  AudioIODeviceType* AudioIODeviceType::createAudioIODeviceType_Android()
  {

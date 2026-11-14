@@ -24,6 +24,7 @@ or
 #### juce_audio_devices
 - libasound2-dev
 - libjack-jackd2-dev (unless `JUCE_JACK=0`)
+- libpipewire-0.3-dev (only needed when `JUCE_PIPEWIRE=1`, which is off by default)
 
 #### juce_audio_processors
 - ladspa-sdk (unless `JUCE_PLUGINHOST_LADSPA=0`)
@@ -63,7 +64,7 @@ available during runtime.
 - mesa-common-dev
 - libegl-dev
 
-The full command is as follows:
+The command for the required dependencies is as follows:
 
     sudo apt update
     sudo apt install libasound2-dev libjack-jackd2-dev \
@@ -73,3 +74,29 @@ The full command is as follows:
         libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libxi-dev \
         libwebkit2gtk-4.1-dev \
         libglu1-mesa-dev mesa-common-dev libegl-dev
+
+The optional backends are covered below, starting with [PipeWire](#optional-pipewire).
+
+## Optional: PipeWire
+
+The PipeWire backend is disabled by default. To build with it, set
+`JUCE_PIPEWIRE=1` and install the development headers:
+
+    sudo apt install libpipewire-0.3-dev
+
+libpipewire is loaded at run time, so nothing has to be linked, but the compiler
+has to be able to find the headers. The package installs them into
+`/usr/include/pipewire-0.3` and `/usr/include/spa-0.2`, which are not in the
+default include path. `libpipewire-0.3.pc` lists `libspa-0.2` in its `Requires:`,
+so asking pkg-config for the former prints both `-I` flags - with CMake this is
+enough:
+
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(PIPEWIRE REQUIRED libpipewire-0.3)
+    target_include_directories(<target> SYSTEM PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
+
+With GCC and Clang, `SYSTEM` makes CMake pass these directories with `-isystem`
+instead of plain `-I`, which the compiler treats as system headers. That avoids a
+number of pedantic warnings from these third-party headers. Nothing is linked
+from pkg-config here: libpipewire is loaded with `dlopen()` at runtime, so adding
+its `-l` flag would turn it into a hard startup dependency for no benefit.

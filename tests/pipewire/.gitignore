@@ -1,0 +1,5 @@
+# Build trees (the stress test builds JUCE itself, so these are large) and the
+# captured logs of previous runs.
+build/
+build-*/
+logs/
